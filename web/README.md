@@ -1,110 +1,31 @@
-# Web UI for MedDataOS Monitor
+# MedDataOS page
 
-Real-time web interface to monitor MedDataOS (Medical Data Operating System) execution with live log streaming.
+The server in `web/backend` opens one case folder and serves this page. Start it from the project root as the [README](../README.md) describes. The page is the URL printed at startup, with `?patient=` set to the folder name. Optional specialists are registered with `--agents` or `--specialist`; see [Connect an agent](../docs/agents.md).
 
-## Features
+`HOST` and `PORT` in `.env` bind the server. The defaults are `127.0.0.1` and `8080`. When `HOST` is `0.0.0.0` or `::`, the printed URL still uses `127.0.0.1`.
 
-- **Patient Sidebar**: Browse 10 patients (P0001–P0010), expand to see conversations, create new ones, switch between them
-- **Patient Context**: Active patient demographics (age, sex, blood type, allergies, conditions) injected into AI system prompt
-- **Real-time Log Streaming**: See all system logs in real-time via WebSockets
-- **Color-coded Log Types**: Different colors for user messages, assistant responses, tool calls, and results
-- **Auto-scroll**: Automatically scroll to latest logs
-- **Clean UI**: Simple, modern interface with warm/brown design system
-- **Non-blocking**: The system runs normally - web UI just observes
+## Sidebar
 
-## Architecture
+`GET /api/patients` returns the open folder. Its id and, until the agent answers, its name are the folder name. The startup request in [Connect an agent](../docs/agents.md) can replace the name, age, sex, blood type, allergies, and conditions. Hovering the name shows that card, plus Notes, Tables, or DICOM when the discovery report contains those files.
 
-```
-web/
-├── backend/
-│   └── server.py           # FastAPI server with WebSocket support
-└── frontend/
-    ├── index.html          # Main UI page
-    ├── style.css           # Styling
-    └── app.js              # WebSocket client logic
-```
+The folder's files are served at `/case/…`. A citation's `web_path` points there.
 
-## How to Run
+Conversations under the patient are the chat sessions for that folder name. `+ New` creates an empty one. The label is the first 60 characters of the first question, or `New conversation`. Sessions live in this process. After a restart the list is empty, and a session id still stored in the browser is not reused.
 
-### 1. Install Dependencies
+## Chat
 
-```bash
-pip install -r requirements.txt
-```
+The box posts `message`, and the current `session_id` and `patient_id` when it has them, to `POST /api/chat`. Send stays disabled until the WebSocket is open, the box has text, and the current session is idle. Enter sends; Shift+Enter inserts a line.
 
-### 2. Start the Web Server
+The reply arrives on the WebSocket as `type: assistant` for that session. The page also reads `GET /api/session/{id}` on reconnect and every few seconds while it is waiting, so a reply still shows if the socket missed it. A second question in a session that is already waiting returns an error and is not sent to the agent.
 
-```bash
-python web/backend/server.py
-```
+An assistant message that is JSON with `response` and a non-empty `citations` list is rendered from `response`. Each `[cite:id]` becomes a Source marker. Hovering it previews the file at `web_path`: png, jpg, jpeg, and svg as an image, mp4 as video, wav as audio, csv as a table, and anything else as text. Opening the marker shows that file and the citation summary. A summary that splits into two or more pieces of at least 20 characters, on a period or a newline, becomes a checkbox list of up to eight boxes. Checked boxes are stored for this process with `PATCH /api/patients/{id}/reviews`, under the citation's web path.
 
-The server will start on `http://127.0.0.1:8080`
+Other assistant text is shown as markdown. `Clear` drops the selection on the page. The session remains on the server.
 
-### 3. Open in Browser
+The paperclip accepts `.csv` and `.xlsx`. The server writes the bytes to `data/input/dataset.csv` or `data/input/dataset.xlsx`, replacing the previous upload, and appends `[Uploaded file: <name>]` to the question. The agent sees that line. The file stays out of the case folder, so the med-datactrl tools do not list it. `data/` is gitignored.
 
-Navigate to: `http://127.0.0.1:8080`
+## Pins
 
-### 4. Start the Pipeline
+The pin control on a citation, or a selection inside an assistant message, posts to `/api/patients/{id}/pins`. A citation pin stores the citation, the question text, and the session id. A text pin stores the selected text and the session id. Pinning the same citation web path, or the same text, again returns the existing pin.
 
-Click the "Start Pipeline" button in the UI to begin the agent execution.
-
-## Log Types
-
-The UI displays different log types with distinct colors:
-
-- 🧑‍💬 **User** (Green): User input messages
-- 🤖 **Assistant** (Purple): Assistant responses
-- 🛠️ **Tool Call** (Orange): Agent/tool invocations
-- 📦 **Tool Result** (Pink): Results from tool executions
-- ℹ️ **System** (Blue): System messages
-
-## Technical Details
-
-- **Backend**: FastAPI with WebSocket support
-- **Frontend**: Vanilla JavaScript (no framework dependencies)
-- **Communication**: WebSocket for real-time bidirectional communication
-- **Logging**: Extended `src/utils/logging.py` to broadcast to WebSocket clients
-- **Non-invasive**: Original system logic unchanged - logging just broadcasts to UI
-
-## Endpoints
-
-- `GET /` - Serve the web UI
-- `WebSocket /ws` - WebSocket endpoint for log streaming
-- `POST /api/chat` - Chat with file upload and patient context
-- `GET /api/patients` - List all patients
-- `GET /api/patients/{id}/conversations` - List conversations for a patient
-- `POST /api/patients/{id}/conversations` - Create a new conversation for a patient
-- `GET /api/session/{id}` - Get session history
-- `POST /api/start` - Start the agent pipeline (legacy)
-- `GET /api/health` - Health check endpoint
-
-## Customization
-
-### Change Server Port
-
-Edit `web/backend/server.py`:
-
-```python
-start_server(host="127.0.0.1", port=8080)  # Change port here
-```
-
-### Modify UI Colors
-
-Edit `web/frontend/style.css` to customize the color scheme.
-
-### Add New Log Types
-
-1. Add icon in `web/frontend/app.js`:
-```javascript
-const LOG_ICONS = {
-    new_type: '🎯'
-};
-```
-
-2. Add styling in `web/frontend/style.css`:
-```css
-.log-entry.new_type {
-    background: rgba(255, 0, 0, 0.1);
-    color: #ff0000;
-}
-```
+The right-hand panel lists pins for the open patient. Unpinning deletes that pin. A note and the tags `#follow-up`, `#critical`, `#reviewed`, `#discuss`, and `#normal` are saved on a citation pin with `PATCH`. Pins last until the process stops. Choosing a pin scrolls the source session to that citation or text.

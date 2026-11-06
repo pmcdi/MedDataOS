@@ -69,5 +69,13 @@ Thumbs.db
 # Test/tool caches
 .pytest_cache/
 .superpowers/
+
+# Pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Local uploads may contain patient data
+data/
+
 # local instructions
 CLAUDE.md

@@ -49,16 +49,161 @@ const modalProvenance = document.getElementById('modal-provenance');
 const modalProvenancePanel = document.getElementById('modal-provenance-panel');
 
 // ─── Sidebar: Load Patients ─────────────────────────────────
+function dicomRecord(citation) {
+    const record = citation && citation.dicom;
+    return record && typeof record === 'object' ? record : null;
+}
+
+function dicomPreviews(citation) {
+    const record = dicomRecord(citation);
+    return record && Array.isArray(record.previews) ? record.previews : [];
+}
+
+function dicomPreviewSrc(citation, preview) {
+    const params = new URLSearchParams();
+    params.set('web_path', (preview && preview.web_path) || citation.web_path);
+    if (preview) {
+        if (preview.slice_index != null) params.set('slice_index', String(preview.slice_index));
+        if (preview.window) params.set('window', preview.window);
+        if (preview.overlay) params.set('overlay', 'true');
+        if (preview.roi) params.set('roi', preview.roi);
+    }
+    return '/api/dicom/preview?' + params.toString();
+}
+
+function dicomCaption(preview) {
+    if (!preview) return '';
+    const parts = [];
+    if (preview.slice_index != null) {
+        const count = preview.n_slices != null ? ` of ${preview.n_slices}` : '';
+        parts.push(`slice ${preview.slice_index}${count}`);
+    }
+    if (preview.window) parts.push(preview.window);
+    if (preview.roi) parts.push(preview.roi);
+    else if (preview.overlay) parts.push('overlay');
+    return parts.join(' · ');
+}
+
+function dicomValue(value) {
+    if (Array.isArray(value)) return value.map(item => dicomValue(item)).join(', ');
+    if (value && typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+}
+
+const DICOM_META_LABELS = {
+    Modality: 'Modality',
+    SeriesDescription: 'Series',
+    BodyPartExamined: 'Body part',
+    StudyDescription: 'Study',
+    ProtocolName: 'Protocol',
+    series_kind: 'Kind',
+    instance_count: 'Images',
+    ImageType: 'Image type',
+    roi_names: 'Structures',
+    structure_set_label: 'Structure set',
+    NumROIs: 'ROIs',
+    RTPlanLabel: 'Plan',
+    RTPlanName: 'Plan name',
+    DoseType: 'Dose type',
+    DoseUnits: 'Dose units',
+    DoseSummationType: 'Dose sum',
+    PatientID: 'Patient',
+    StudyInstanceUID: 'Study UID',
+    SeriesInstanceUID: 'Series UID',
+    FrameOfReferenceUID: 'Frame of reference',
+    ReferencedSeriesUID: 'Referenced series',
+    child_series_ids: 'Child series',
+    child_modalities: 'Child modalities',
+    z_first_mm: 'Z first',
+    z_last_mm: 'Z last',
+    z_span_mm: 'Z span',
+    z_superior_mm: 'Z superior',
+    suggested_slice_index: 'Suggested slice',
+    preferred_roi: 'Preferred structure',
+};
+
+const DICOM_CARD_KEYS = [
+    'Modality',
+    'SeriesDescription',
+    'StudyDescription',
+    'BodyPartExamined',
+    'instance_count',
+    'roi_names',
+    'RTPlanLabel',
+    'DoseType',
+    'DoseUnits',
+];
+
+const DICOM_ID_KEYS = [
+    'PatientID',
+    'StudyInstanceUID',
+    'SeriesInstanceUID',
+    'FrameOfReferenceUID',
+    'ReferencedSeriesUID',
+    'child_series_ids',
+    'child_modalities',
+];
+
+function dicomMetaPresent(metadata, key) {
+    const value = metadata[key];
+    if (value == null || value === '') return false;
+    return !(Array.isArray(value) && value.length === 0);
+}
+
+function dicomCitedFields(citation, metadata) {
+    if (!Array.isArray(citation.fields)) return [];
+    return citation.fields.filter(key => typeof key === 'string' && dicomMetaPresent(metadata, key));
+}
+
+function renderDicomMetaRows(metadata, keys, cited) {
+    const citedSet = new Set(cited);
+    const idSet = new Set(DICOM_ID_KEYS);
+    return `<dl class="dicom-meta">${keys.map(key => {
+        const rowClass = citedSet.has(key) ? ' class="dicom-meta-cited"' : '';
+        const valueClass = idSet.has(key) ? ' class="dicom-meta-id"' : '';
+        return `<div${rowClass}>`
+            + `<dt>${escapeHtml(DICOM_META_LABELS[key] || key)}</dt>`
+            + `<dd${valueClass}>${escapeHtml(dicomValue(metadata[key]))}</dd></div>`;
+    }).join('')}</dl>`;
+}
+
+function renderDicomMeta(citation, scope) {
+    const metadata = dicomRecord(citation)?.metadata;
+    if (!metadata) return '';
+    const cited = dicomCitedFields(citation, metadata);
+    if (scope === 'card') {
+        const keys = cited.length
+            ? cited
+            : DICOM_CARD_KEYS.filter(key => dicomMetaPresent(metadata, key));
+        return keys.length ? renderDicomMetaRows(metadata, keys, cited) : '';
+    }
+    const idSet = new Set(DICOM_ID_KEYS);
+    const rest = Object.keys(metadata).filter(key =>
+        !idSet.has(key) && dicomMetaPresent(metadata, key) && !DICOM_CARD_KEYS.includes(key)
+    );
+    const clinical = [
+        ...DICOM_CARD_KEYS.filter(key => dicomMetaPresent(metadata, key)),
+        ...rest,
+    ];
+    const ids = DICOM_ID_KEYS.filter(key => dicomMetaPresent(metadata, key));
+    const clinicalHTML = clinical.length ? renderDicomMetaRows(metadata, clinical, cited) : '';
+    const idHTML = ids.length
+        ? `<div class="dicom-meta-group">Identifiers</div>${renderDicomMetaRows(metadata, ids, cited)}`
+        : '';
+    const body = clinicalHTML + idHTML;
+    return body ? `<div class="dicom-meta-sheet">${body}</div>` : '';
+}
+
 async function loadPatients() {
     try {
         const res = await fetch('/api/patients');
         patients = await res.json();
         renderPatientList();
 
-        // Auto-expand patient from URL param (?patient=P0003), or default to P0001
-        const urlPatientId = new URLSearchParams(window.location.search).get('patient') || 'P0001';
+        // Auto-expand the requested patient, or the first case returned by the server.
+        const urlPatientId = new URLSearchParams(window.location.search).get('patient') || patients[0]?.id;
         const targetPatient = document.querySelector(`.sidebar-patient[data-patient-id="${urlPatientId}"]`)
-            || document.querySelector('.sidebar-patient[data-patient-id="P0001"]');
+            || document.querySelector('.sidebar-patient');
         if (targetPatient) {
             await togglePatient(targetPatient);
             const firstConvo = targetPatient.querySelector('.conversation-item');
@@ -115,7 +260,7 @@ function showPatientTooltip(headerEl, patient) {
         patientTooltip.innerHTML = `
             <div class="patient-tooltip-header">
                 <span class="patient-tooltip-name">${escapeHtml(patient.name)}</span>
-                <span class="patient-tooltip-demo">${patient.age} · ${patient.sex}${patient.blood_type ? ' · ' + patient.blood_type : ''}</span>
+                <span class="patient-tooltip-demo">${escapeHtml([patient.age, patient.sex, patient.blood_type].filter(Boolean).join(' · '))}</span>
             </div>
             <div class="patient-tooltip-section">
                 <span class="patient-tooltip-label">Conditions</span>
@@ -170,7 +315,7 @@ function renderPatientList() {
             <div class="sidebar-patient-header">
                 <span class="sidebar-patient-arrow">▶</span>
                 <span class="sidebar-patient-name">${escapeHtml(p.name)}</span>
-                <span class="sidebar-patient-meta">${p.age}, ${p.sex}</span>
+                <span class="sidebar-patient-meta">${escapeHtml(patientMeta(p))}</span>
             </div>
             <div class="sidebar-patient-body">
                 <div class="conversation-list"></div>
@@ -180,11 +325,32 @@ function renderPatientList() {
 
         // Tooltip hover handlers
         const header = div.querySelector('.sidebar-patient-header');
-        header.addEventListener('mouseenter', () => showPatientTooltip(header, p));
+        header.addEventListener('mouseenter', () => showPatientTooltip(header, patientDataMap[p.id]));
         header.addEventListener('mouseleave', hidePatientTooltip);
 
         sidebarContent.appendChild(div);
     });
+}
+
+function patientMeta(p) {
+    return [p.age, p.sex].filter(Boolean).join(', ');
+}
+
+// The server pushes the card again once the agent has read the files.
+function updatePatient(p) {
+    patients = patients.map(existing => existing.id === p.id ? p : existing);
+    patientDataMap[p.id] = p;
+
+    const div = document.querySelector(`.sidebar-patient[data-patient-id="${CSS.escape(p.id)}"]`);
+    if (!div) return;
+
+    div.dataset.patientName = p.name;
+    div.querySelector('.sidebar-patient-name').textContent = p.name;
+    div.querySelector('.sidebar-patient-meta').textContent = patientMeta(p);
+
+    if (activePatientId === p.id) {
+        activePatientLabel.textContent = `— ${p.name}`;
+    }
 }
 
 // Keep tooltip open when hovering over it
@@ -299,7 +465,7 @@ function updateCitationBadgeStates() {
                 }
             }
             const conflict = getCitationConflict(citation);
-            if (conflict) {
+            if (conflict || notesConflictsToShow(citation).length) {
                 badge.classList.add('citation-has-conflict');
             }
         } catch (e) { /* skip malformed */ }
@@ -307,6 +473,23 @@ function updateCitationBadgeStates() {
 }
 
 function buildPinPreview(citation) {
+    const record = dicomRecord(citation);
+    if (record) {
+        const preview = dicomPreviews(citation).at(-1);
+        if (preview) {
+            return `<div class="pinned-card-preview"><img class="dicom-preview" src="${dicomPreviewSrc(citation, preview)}" alt=""></div>`;
+        }
+        const metadata = record.metadata || {};
+        const modality = metadata.Modality || 'DICOM';
+        const series = metadata.SeriesDescription || metadata.structure_set_label || '';
+        if (!series) {
+            return `<div class="pinned-card-preview"><span class="pinned-card-preview-label">${escapeHtml(String(modality))}</span></div>`;
+        }
+        return `<div class="pinned-card-preview pinned-dicom-meta">`
+            + `<span class="pinned-dicom-modality">${escapeHtml(String(modality))}</span>`
+            + `<span class="pinned-dicom-series">${escapeHtml(String(series))}</span>`
+            + `</div>`;
+    }
     const type = getCitationType(citation.file);
     if (type === 'image') {
         const isSvg = citation.file.endsWith('.svg');
@@ -359,7 +542,7 @@ function renderInsightsPanel() {
             card.dataset.pinType = 'citation';
             card.dataset.citation = JSON.stringify(p.citation);
             card.dataset.source = p.source || '';
-            const agentLabel = agentCardLabels[p.citation.agent] || p.citation.agent.replace(/_/g, ' ');
+            const agentLabel = citationLabel(agentCardLabels, p.citation.agent, p.citation);
             const previewHTML = buildPinPreview(p.citation);
             const annotationText = p.annotations && p.annotations.text ? p.annotations.text : '';
             const annotationTags = p.annotations && p.annotations.tags && p.annotations.tags.length > 0 ? p.annotations.tags : [];
@@ -530,6 +713,7 @@ async function switchConversation(patientId, sid) {
 
     // Clear chat and load history
     chatContainer.innerHTML = '';
+    let waiting = false;
     try {
         const res = await fetch(`/api/session/${sid}`);
         const data = await res.json();
@@ -537,10 +721,12 @@ async function switchConversation(patientId, sid) {
             data.history.forEach(msg => {
                 addChatMessage(msg.role, msg.content, msg.timestamp);
             });
+            waiting = !!data.processing;
         }
     } catch (e) {
         console.error('Failed to load session:', e);
     }
+    setProcessing(waiting);
     highlightPinnedText();
     updateCitationBadgeStates();
 }
@@ -608,6 +794,7 @@ function connectWebSocket() {
         console.log('WebSocket connected');
         updateConnectionStatus(true);
         updateSendButton();
+        resyncSession();
     };
 
     ws.onmessage = (event) => {
@@ -631,15 +818,26 @@ function connectWebSocket() {
 // Handle WebSocket messages
 function handleWebSocketMessage(data) {
     // Skip initial connection messages
-    if (data.type === 'system' && data.message === 'Connected to MedDataOS Monitor') {
+    if (data.type === 'system' && data.message === 'Connected to MedDataOS') {
+        return;
+    }
+
+    if (data.type === 'patient' && data.patient) {
+        updatePatient(data.patient);
         return;
     }
 
     // Handle assistant messages - show as chat bubble only
     if (data.type === 'assistant') {
-        removeTypingIndicator();
-        isProcessing = false;
-        updateSendButton();
+        if (data.session_id && data.session_id !== sessionId) {
+            return;
+        }
+        // Already shown by resyncSession.
+        if (!isProcessing) {
+            return;
+        }
+
+        setProcessing(false);
         addChatMessage('assistant', data.message, data.timestamp || new Date().toISOString());
         updateCitationBadgeStates();
         // Refresh sidebar to update conversation preview
@@ -733,6 +931,47 @@ function removeFile() {
     fileName.textContent = '';
 }
 
+function citationLabel(labels, agent, citation) {
+    if (citation && citation.kind === 'derived') {
+        return labels === agentCardLabels ? 'Derived result' : 'Derived';
+    }
+    if (!agent) {
+        if (citation && dicomPreviews(citation).length) return 'Imaging';
+        if (citation && dicomRecord(citation)?.metadata) return 'DICOM';
+        if (citation && dicomRecord(citation)) return 'Imaging';
+        return 'Source';
+    }
+    return labels[agent] || String(agent).replace(/_/g, ' ');
+}
+
+function derivedResultText(citation) {
+    const result = citation && citation.result;
+    if (!result || result.value == null || result.value === '') return '';
+    const value = String(result.value);
+    return result.unit ? `${value} ${result.unit}` : value;
+}
+
+function renderDerivedBlock(citation, compact) {
+    if (!citation || citation.kind !== 'derived') return '';
+    const parts = [];
+    const resultText = derivedResultText(citation);
+    if (resultText) {
+        parts.push(`<div class="derived-result${compact ? ' derived-result-compact' : ''}">${escapeHtml(resultText)}</div>`);
+    }
+    if (citation.method) {
+        parts.push(`<div class="derived-method">${escapeHtml(citation.method)}</div>`);
+    }
+    if (!compact && citation.detail) {
+        parts.push(`<div class="derived-detail">${escapeHtml(citation.detail)}</div>`);
+    }
+    if (!compact && Array.isArray(citation.inputs) && citation.inputs.length) {
+        parts.push(
+            `<ul class="derived-inputs">${citation.inputs.map(item => `<li>${escapeHtml(String(item))}</li>`).join('')}</ul>`
+        );
+    }
+    return parts.length ? `<div class="derived-block">${parts.join('')}</div>` : '';
+}
+
 // Agent ID → short display label for citation badges
 const agentBadgeLabels = {
     'clinical_notes': 'Notes',
@@ -769,9 +1008,9 @@ const agentFindingsLabel = {
 // Provenance pipeline steps per agent (static processing stages)
 const provenanceSteps = {
     'clinical_notes': [
-        { label: 'Data Origin', desc: 'Physician documentation, EHR export' },
-        { label: 'NLP Extraction', desc: 'Named entity recognition: conditions, medications, vitals' },
-        { label: 'Summarization', desc: 'Key findings extraction, temporal ordering' },
+        { label: 'Ledger', desc: 'Grounded facts compiled from the notes' },
+        { label: 'Timeline and conflicts', desc: 'Dates ordered; disagreements between notes kept' },
+        { label: 'Verified quotes', desc: 'Each claim checked against a span in the source note' },
     ],
     'chest_xray': [
         { label: 'Data Origin', desc: 'Posteroanterior chest radiograph, digital acquisition' },
@@ -810,16 +1049,16 @@ const provenanceSteps = {
 // Agent info for tooltip (per agent type) — model-card style
 const agentInfo = {
     'clinical_notes': {
-        model: 'GatorTron 8.9B',
-        modelUrl: 'https://huggingface.co/UFNLP/gatortron-large',
-        purpose: 'Extracts diagnoses, medications, and clinical relationships from unstructured physician notes',
-        input: 'Free-text clinical notes (.txt)',
-        output: 'Named entities (conditions, medications, vitals), clinical relationships, temporal ordering',
-        method: 'Transformer-based clinical NLP trained on 90B words of EHR text',
-        accuracy: 'F1 +7.5% vs ClinicalBERT',
-        paper: 'https://www.nature.com/articles/s41746-022-00742-2',
-        license: 'Apache 2.0',
-        limitations: 'May miss implicit clinical reasoning or abbreviations not seen in training data. Not validated for non-English notes.',
+        model: 'Gemini (compile-then-navigate)',
+        modelUrl: '',
+        purpose: 'Answers questions from the clinical notes with verified, span-level citations',
+        input: 'Clinical notes (.txt, and scanned pages when a transcript exists)',
+        output: 'Verified claims with highlighted source quotes and documented discrepancies',
+        method: 'Grounded fact ledger, timeline, and conflict check. Direct reading for small charts.',
+        accuracy: 'Each claim is span-grounded and entailment-checked',
+        paper: 'https://arxiv.org/abs/2512.24601',
+        license: 'N/A',
+        limitations: 'Extraction can miss facts. Inferred dates are approximate. Advisory only.',
     },
     'chest_xray': {
         model: 'TorchXRayVision',
@@ -904,7 +1143,9 @@ function getCitationDate(citation) {
     const parts = citation.web_path.split('/');
     const modalityDir = parts.length >= 3 ? parts[2] : '';
     const date = patient.data_dates[modalityDir];
-    return date ? formatShortDate(date) : '';
+    if (date) return formatShortDate(date);
+    const dated = (citation.evidence || []).find(item => item.note_date);
+    return dated ? formatShortDate(dated.note_date) : '';
 }
 
 // Check if a citation has knowledge_bus conflicts
@@ -912,7 +1153,7 @@ function getCitationConflict(citation) {
     const bus = citation.knowledge_bus;
     if (!bus || !bus.contradicted_by || !bus.contradicted_by.length) return null;
     const first = bus.contradicted_by[0];
-    const label = agentBadgeLabels[first.agent] || first.agent.replace(/_/g, ' ');
+    const label = citationLabel(agentBadgeLabels, first.agent);
     return { count: bus.contradicted_by.length, firstAgent: label, finding: first.finding };
 }
 
@@ -921,11 +1162,11 @@ function renderWithCitations(html, citations) {
     const citationMap = {};
     citations.forEach(c => { citationMap[c.id] = c; });
 
-    return html.replace(/\[cite:(\w+)\]/g, (match, id) => {
+    return html.replace(/\[cite:([^\]]+)\]/g, (match, id) => {
         const citation = citationMap[id];
         if (!citation) return match;
         const data = encodeURIComponent(JSON.stringify(citation));
-        const label = agentBadgeLabels[citation.agent] || citation.agent.replace(/_/g, ' ');
+        const label = citationLabel(agentBadgeLabels, citation.agent, citation);
         const dateStr = getCitationDate(citation);
         return `<span class="citation-group"><sup class="citation" data-citation="${data}">${escapeHtml(label)}</sup>${dateStr ? `<span class="citation-date">${dateStr}</span>` : ''}</span>`;
     });
@@ -951,11 +1192,21 @@ function buildCitationForAgent(agent) {
     return { id: '0', agent, file, web_path, summary: '' };
 }
 
-// Derive modality type from file extension
+// A real suffix such as .txt. A DICOM folder like "Neck 2.0 CE" has dots but no suffix.
+function citationSuffix(file) {
+    const name = String(file || '').split('/').pop();
+    const dot = name.lastIndexOf('.');
+    if (dot <= 0 || dot < name.length - 6) return '';
+    return name.slice(dot + 1).toLowerCase();
+}
+
+// Derive modality type from file extension. Unknown paths are not text files.
 function getCitationType(file) {
-    const ext = file.split('.').pop().toLowerCase();
-    return { png: 'image', jpg: 'image', jpeg: 'image', svg: 'image',
-             csv: 'csv', txt: 'text', mp4: 'video', wav: 'audio' }[ext] || 'text';
+    return {
+        png: 'image', jpg: 'image', jpeg: 'image', svg: 'image',
+        csv: 'csv', txt: 'text', md: 'text', json: 'text',
+        mp4: 'video', wav: 'audio',
+    }[citationSuffix(file)] || '';
 }
 
 // Convert plain text to reflowed HTML paragraphs (collapse hard line-wraps)
@@ -966,6 +1217,123 @@ function plainTextToHTML(text) {
         .filter(Boolean)
         .map(p => `<p>${escapeHtml(p)}</p>`)
         .join('');
+}
+
+// ── Clinical notes evidence (verified quotes + documented discrepancies) ──
+function hasNotesEvidence(citation) {
+    return Array.isArray(citation.evidence) && citation.evidence.length > 0;
+}
+
+function evidenceSourceLabel(ev) {
+    const date = ev.note_date ? ` \u00B7 ${ev.note_date}` : '';
+    const ocr = ev.derived === 'ocr' ? ' \u00B7 OCR' : '';
+    return `${ev.label || ev.note_id}${date}${ocr}`;
+}
+
+function groupEvidenceByClaim(evidence) {
+    const groups = [];
+    const byN = {};
+    evidence.forEach(ev => {
+        const key = ev.n ?? groups.length + 1;
+        if (!byN[key]) {
+            byN[key] = { n: key, claim: ev.claim, entailment: ev.entailment, items: [] };
+            groups.push(byN[key]);
+        }
+        byN[key].items.push(ev);
+    });
+    return groups;
+}
+
+function renderEvidenceQuote(ev) {
+    const url = ev.span_url ? ` data-span-url="${escapeHtml(ev.span_url)}"` : '';
+    return `<div class="evidence-quote"${url}>`
+        + `<mark>${escapeHtml(ev.quote || '')}</mark>`
+        + `<span class="evidence-source">${escapeHtml(evidenceSourceLabel(ev))}</span>`
+        + `</div>`;
+}
+
+function renderEvidenceCompact(evidence, maxQuotes = 3) {
+    const shown = evidence.slice(0, maxQuotes);
+    const more = evidence.length - shown.length;
+    return `<div class="card-text card-evidence">`
+        + shown.map(renderEvidenceQuote).join('')
+        + (more > 0 ? `<div class="evidence-more">+${more} more quote${more > 1 ? 's' : ''} \u2014 click to review</div>` : '')
+        + `</div>`;
+}
+
+function renderEvidenceFull(evidence) {
+    return groupEvidenceByClaim(evidence).map(group => {
+        const partial = group.entailment === 'partial'
+            ? '<span class="evidence-partial">partially verified</span>' : '';
+        return `<div class="evidence-claim">`
+            + `<div class="evidence-claim-text"><span class="evidence-n">[${escapeHtml(String(group.n))}]</span> ${escapeHtml(group.claim || '')}${partial}</div>`
+            + group.items.map(renderEvidenceQuote).join('')
+            + `</div>`;
+    }).join('');
+}
+
+function notesConflictsToShow(citation) {
+    return (citation.conflicts || []).filter(c => c.severity !== 'info');
+}
+
+function renderNotesConflicts(conflicts, compact = false) {
+    if (!conflicts.length) return '';
+    const items = conflicts.map(c => {
+        const attr = (c.attribute || '').split('.').pop().replace(/_/g, ' ');
+        const values = (c.values || []).map(v => {
+            const url = v.span_url ? ` data-span-url="${escapeHtml(v.span_url)}"` : '';
+            return `<span class="notes-conflict-value"${url}>${escapeHtml(String(v.value ?? ''))}`
+                + ` <span class="evidence-source">${escapeHtml(v.note_label || '')}</span></span>`;
+        }).join('<span class="notes-conflict-vs">vs</span>');
+        const rationale = compact ? '' : `<div class="notes-conflict-rationale">${escapeHtml(c.rationale || '')}</div>`;
+        return `<div class="notes-conflict notes-conflict-${escapeHtml(c.severity || 'medium')}">`
+            + `<div class="notes-conflict-head">\u26A0 ${escapeHtml(attr)}</div>`
+            + `<div class="notes-conflict-values">${values}</div>${rationale}</div>`;
+    }).join('');
+    return `<div class="notes-conflicts"><div class="notes-conflicts-title">Documented discrepancies</div>${items}</div>`;
+}
+
+async function loadNoteSpan(url, container) {
+    container.innerHTML = '<div class="modal-loading">Loading\u2026</div>';
+    try {
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        const { start, end } = data.highlight;
+        const text = data.text;
+        const meta = [data.label, data.note_date, data.note_type, data.derived === 'ocr' ? `OCR page ${(data.page_index ?? 0) + 1}` : null]
+            .filter(Boolean).map(escapeHtml).join(' \u00B7 ');
+        container.innerHTML = `<div class="note-viewer-meta">${meta}</div>`
+            + `<div class="note-viewer-text">${data.truncated_before ? '\u2026' : ''}`
+            + escapeHtml(text.slice(0, start))
+            + `<mark class="note-highlight">${escapeHtml(text.slice(start, end))}</mark>`
+            + escapeHtml(text.slice(end))
+            + `${data.truncated_after ? '\u2026' : ''}</div>`;
+        container.querySelector('.note-highlight')?.scrollIntoView({ block: 'center' });
+    } catch (err) {
+        container.innerHTML = `<div class="modal-text" style="color: var(--critical);">Could not load source span: ${escapeHtml(String(err.message || err))}</div>`;
+    }
+}
+
+function renderNotesModalBody(citation, focusSpanUrl = null) {
+    const conflicts = notesConflictsToShow(citation);
+    modalBody.innerHTML = `<div class="notes-modal">`
+        + `<div class="notes-evidence-pane">${renderNotesConflicts(conflicts)}${renderEvidenceFull(citation.evidence)}</div>`
+        + `<div class="note-viewer"></div>`
+        + `</div>`;
+    const viewer = modalBody.querySelector('.note-viewer');
+    const select = el => {
+        modalBody.querySelectorAll('[data-span-url].active').forEach(x => x.classList.remove('active'));
+        el.classList.add('active');
+        loadNoteSpan(el.dataset.spanUrl, viewer);
+    };
+    modalBody.querySelectorAll('[data-span-url]').forEach(el => {
+        el.addEventListener('click', () => select(el));
+    });
+    const spans = [...modalBody.querySelectorAll('[data-span-url]')];
+    const initial = (focusSpanUrl && spans.find(el => el.dataset.spanUrl === focusSpanUrl))
+        || modalBody.querySelector('.evidence-quote[data-span-url]');
+    if (initial) select(initial);
 }
 
 // Parse CSV text into an HTML table (first maxRows rows, first maxCols columns)
@@ -1006,20 +1374,31 @@ let hideTimeout = null;
 
 async function showCitationPopup(anchor, citation) {
     clearTimeout(hideTimeout);
+    citationPopup._citation = citation;
 
-    const type = getCitationType(citation.file);
-    const agentLabel = agentCardLabels[citation.agent] || citation.agent.replace(/_/g, ' ');
+    const type = dicomRecord(citation) ? 'dicom' : getCitationType(citation.file);
+    const agentLabel = citationLabel(agentCardLabels, citation.agent, citation);
+    const dicomPreview = type === 'dicom' ? dicomPreviews(citation).at(-1) : null;
+    const dicomMetaOnly = type === 'dicom' && !dicomPreview && dicomRecord(citation)?.metadata;
 
     // Build initial content (immediate for media, loading state for text/csv)
     let contentHTML = '';
-    if (type === 'image') {
+    let contentClass = 'card-content';
+    if (dicomMetaOnly) {
+        contentHTML = renderDicomMeta(citation, 'card');
+        contentClass = 'card-content card-content-meta';
+    } else if (type === 'dicom' && dicomPreview) {
+        contentHTML = `<img class="card-image dicom-preview" src="${dicomPreviewSrc(citation, dicomPreview)}" alt="${escapeHtml(agentLabel)}">`;
+    } else if (type === 'image') {
         const isSvg = citation.file.endsWith('.svg');
         contentHTML = `<img class="card-image${isSvg ? ' card-image-svg' : ''}" src="${citation.web_path}" alt="${escapeHtml(agentLabel)}">`;
     } else if (type === 'video') {
         contentHTML = `<video class="card-video" src="${citation.web_path}" controls></video>`;
     } else if (type === 'audio') {
         contentHTML = `<div class="card-audio-wrap"><audio class="card-audio" src="${citation.web_path}" controls></audio></div>`;
-    } else {
+    } else if (hasNotesEvidence(citation)) {
+        contentHTML = renderEvidenceCompact(citation.evidence);
+    } else if (type === 'text' || type === 'csv') {
         contentHTML = `<div class="card-loading">Loading…</div>`;
     }
 
@@ -1047,13 +1426,21 @@ async function showCitationPopup(anchor, citation) {
         ? `<div class="card-conflict">\u26A0 Contradicted by ${escapeHtml(conflict.firstAgent)}${conflict.count > 1 ? ` +${conflict.count - 1}` : ''}</div>`
         : '';
 
+    const dicomHTML = type === 'dicom' && dicomPreview
+        ? `<div class="dicom-caption">${escapeHtml(dicomCaption(dicomPreview))}</div>`
+        : '';
+    const derivedHTML = renderDerivedBlock(citation, true);
+
     citationPopup.innerHTML = `
         <div class="card-header">
             <span class="card-agent">${escapeHtml(agentLabel)}</span>
             ${pinBtnHTML}
         </div>
-        <div class="card-content" id="card-content-inner">${contentHTML}</div>
+        ${contentHTML ? `<div class="${contentClass}" id="card-content-inner">${contentHTML}</div>` : '<div id="card-content-inner"></div>'}
+        ${dicomHTML}
+        ${derivedHTML}
         <div class="card-summary">${summaryHTML}</div>
+        ${renderNotesConflicts(notesConflictsToShow(citation), true)}
         ${conflictHTML}
     `;
 
@@ -1061,12 +1448,15 @@ async function showCitationPopup(anchor, citation) {
     positionPopup(anchor);
 
     // Fetch and render text-based content
-    if (type === 'csv' || type === 'text') {
+    if ((type === 'csv' || type === 'text') && !hasNotesEvidence(citation)) {
         try {
-            const text = await fetch(citation.web_path + '?t=' + Date.now()).then(r => r.text());
+            const response = await fetch(citation.web_path + '?t=' + Date.now());
+            const text = await response.text();
             const inner = document.getElementById('card-content-inner');
             if (inner) {
-                inner.innerHTML = type === 'csv'
+                inner.innerHTML = !response.ok
+                    ? `<div class="card-text card-error">Could not load this file.</div>`
+                    : type === 'csv'
                     ? csvToHTML(text)
                     : `<div class="card-text">${plainTextToHTML(text.slice(0, 600))}${text.length > 600 ? '<p>…</p>' : ''}</div>`;
                 positionPopup(anchor);
@@ -1101,16 +1491,68 @@ function removeTypingIndicator() {
     if (indicator) indicator.remove();
 }
 
+function setProcessing(value) {
+    isProcessing = value;
+    if (value) showTypingIndicator(); else removeTypingIndicator();
+    updateSendButton();
+}
+
+// The socket can miss an answer (reconnect, server restart), so ask the server
+// whether the open conversation is still waiting.
+async function resyncSession() {
+    if (!isProcessing || !sessionId) return;
+    const sid = sessionId;
+
+    try {
+        const res = await fetch(`/api/session/${sid}`);
+        const data = await res.json();
+        if (sid !== sessionId || !isProcessing) return;
+
+        if (data.status !== 'success') {
+            setProcessing(false);
+            return;
+        }
+        if (data.processing) return;
+
+        const answer = data.history[data.history.length - 1];
+        removeTypingIndicator();
+        if (answer && answer.role === 'assistant') {
+            addChatMessage('assistant', answer.content, answer.timestamp);
+            updateCitationBadgeStates();
+        }
+        setProcessing(false);
+        refreshSidebarConversations();
+    } catch (e) {
+        console.error('Failed to check session:', e);
+    }
+}
+
 function renderAssistantContent(rawContent) {
     let responseText = rawContent;
     let citations = [];
-    try {
-        const parsed = JSON.parse(rawContent);
-        if (parsed.response && parsed.citations) {
-            responseText = parsed.response;
-            citations = parsed.citations;
+    const cut = rawContent.search(/\n\s*\{/);
+    const candidates = [rawContent];
+    if (cut !== -1) candidates.push(rawContent.slice(cut).trim());
+
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            if (parsed.response && parsed.citations) {
+                responseText = parsed.response;
+                citations = parsed.citations;
+                break;
+            }
+            if (!parsed.citations) {
+                const text = parsed.message || parsed.response || parsed.text;
+                if (typeof text === 'string' && text.trim()) {
+                    responseText = text;
+                    break;
+                }
+            }
+        } catch (e) {
+            if (cut !== -1) responseText = rawContent.slice(0, cut).trim();
         }
-    } catch (e) { /* plain text, use as-is */ }
+    }
 
     const rawHtml = marked.parse(responseText);
     const safeHtml = DOMPurify.sanitize(rawHtml);
@@ -1303,6 +1745,7 @@ function clearChat() {
     activePatientId = null;
     activePatientLabel.textContent = '';
     localStorage.removeItem('meddata_session_id');
+    setProcessing(false);
     // Clear attached file
     removeFile();
     // Remove active highlight from sidebar
@@ -1428,7 +1871,17 @@ citationPopup.addEventListener('mouseleave', () => { citationPopup.style.display
 // Pin button on hover card
 citationPopup.addEventListener('click', async (e) => {
     const pinBtn = e.target.closest('.btn-pin-card');
-    if (!pinBtn || !activePatientId) return;
+    if (!pinBtn) {
+        const citation = citationPopup._citation;
+        if (citation && hasNotesEvidence(citation)) {
+            const span = e.target.closest('[data-span-url]');
+            citationPopup.style.display = 'none';
+            clearTimeout(hideTimeout);
+            openCitationModal(citation, null, span ? span.dataset.spanUrl : null);
+        }
+        return;
+    }
+    if (!activePatientId) return;
     e.stopPropagation();
     const citation = JSON.parse(decodeURIComponent(pinBtn.dataset.citation));
     const existingPinId = findPinId(activePatientId, citation);
@@ -1468,7 +1921,7 @@ function csvToModalHTML(csv, maxRows = 200) {
     return html;
 }
 
-async function openCitationModal(citation, pin = null) {
+async function openCitationModal(citation, pin = null, focusSpanUrl = null) {
     modalCitation = citation;
 
     // Look up pin if not provided
@@ -1481,8 +1934,8 @@ async function openCitationModal(citation, pin = null) {
     }
     currentModalPin = pin;
 
-    const type = getCitationType(citation.file);
-    const agentLabel = agentCardLabels[citation.agent] || citation.agent.replace(/_/g, ' ');
+    const type = dicomRecord(citation) ? 'dicom' : getCitationType(citation.file);
+    const agentLabel = citationLabel(agentCardLabels, citation.agent, citation);
 
     modalAgent.textContent = agentLabel;
 
@@ -1568,20 +2021,28 @@ async function openCitationModal(citation, pin = null) {
 
     // ── Build body content ───────────────────────────────────
     let contentHTML = '';
-    if (type === 'image') {
+    if (citation.kind === 'derived') {
+        contentHTML = renderDerivedBlock(citation, false);
+    } else if (type === 'dicom') {
+        const figures = dicomPreviews(citation).map((preview, index, all) => {
+            const main = index === all.length - 1 ? ' dicom-preview-main' : '';
+            return `<figure class="dicom-figure${main}"><img class="dicom-preview" src="${dicomPreviewSrc(citation, preview)}" alt="${escapeHtml(agentLabel)}"><figcaption>${escapeHtml(dicomCaption(preview))}</figcaption></figure>`;
+        }).join('');
+        contentHTML = figures + renderDicomMeta(citation, 'dialog');
+    } else if (type === 'image') {
         const isSvg = citation.file.endsWith('.svg');
         contentHTML = `<img src="${citation.web_path}" alt="${escapeHtml(agentLabel)}"${isSvg ? ' class="modal-image-svg"' : ''}>`;
     } else if (type === 'video') {
         contentHTML = `<video src="${citation.web_path}" controls autoplay></video>`;
     } else if (type === 'audio') {
         contentHTML = `<div class="modal-audio-wrap"><div class="audio-label">Heart sound recording</div><audio src="${citation.web_path}" controls></audio></div>`;
-    } else {
+    } else if (type === 'text' || type === 'csv') {
         contentHTML = '<div class="modal-loading">Loading\u2026</div>';
     }
     modalBody.innerHTML = contentHTML;
 
     // ── Summary or Checklist ────────────────────────
-    const checklistItems = parseSummaryToChecklist(citation.summary);
+    const checklistItems = citation.kind === 'derived' ? null : parseSummaryToChecklist(citation.summary);
     if (checklistItems) {
         const reviewKey = citation.agent + '|' + citation.web_path;
         const checklist_state = (patientReviews[activePatientId] || {})[reviewKey] || {};
@@ -1628,10 +2089,17 @@ async function openCitationModal(citation, pin = null) {
     citationModal.classList.add('open');
 
     // Fetch text-based content
-    if (type === 'csv' || type === 'text') {
+    if (citation.kind === 'derived') {
+        // Method/result already rendered in the body; no file load.
+    } else if (hasNotesEvidence(citation)) {
+        renderNotesModalBody(citation, focusSpanUrl);
+    } else if (type === 'csv' || type === 'text') {
         try {
-            const text = await fetch(citation.web_path + '?t=' + Date.now()).then(r => r.text());
-            modalBody.innerHTML = type === 'csv'
+            const response = await fetch(citation.web_path + '?t=' + Date.now());
+            const text = await response.text();
+            modalBody.innerHTML = !response.ok
+                ? '<div class="modal-text" style="color: var(--critical);">Could not load this file.</div>'
+                : type === 'csv'
                 ? csvToModalHTML(text)
                 : `<div class="modal-text">${plainTextToHTML(text)}</div>`;
         } catch {
@@ -1682,7 +2150,7 @@ function renderAnnotationTags(activeTags) {
 function buildProvenanceHTML(citation) {
     const steps = provenanceSteps[citation.agent] || [];
     const bus = citation.knowledge_bus || { supported_by: [], contradicted_by: [] };
-    const agentLabel = agentBadgeLabels[citation.agent] || citation.agent.replace(/_/g, ' ');
+    const agentLabel = citationLabel(agentBadgeLabels, citation.agent);
 
     // Map agent name to data_dates directory key
     const agentToDirKey = (agent) => {
@@ -1731,7 +2199,7 @@ function buildProvenanceHTML(citation) {
 
     // Helper: build a mini citation badge for a KB entry agent
     const buildKBBadge = (entry) => {
-        const entryAgent = agentBadgeLabels[entry.agent] || entry.agent.replace(/_/g, ' ');
+        const entryAgent = citationLabel(agentBadgeLabels, entry.agent);
         const entryDate = getAgentDate(entry.agent);
         // Try to build a citation object for hover
         const citObj = buildCitationForAgent(entry.agent);
@@ -2156,4 +2624,5 @@ messageInput.addEventListener('keydown', (e) => {
 // Initialize
 connectWebSocket();
 loadPatients();
+setInterval(resyncSession, 5000);
 
