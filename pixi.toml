@@ -1,0 +1,56 @@
+[workspace]
+authors = ["Joshua Siraj <joshua.siraj@ryerson.ca>"]
+channels = ["conda-forge"]
+name = "MedDataOS"
+platforms = ["linux-64"]
+version = "0.2.0"
+
+[dependencies]
+python = ">=3.13,<3.14"
+
+[pypi-dependencies]
+meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists"] }
+
+[environments]
+default = ["style", "docs"]
+library = { features = ["library"], no-default-feature = true }
+
+[tasks]
+stack = { cmd = "python scripts/stack.py", description = "Start the router, specialists, and web server for one case" }
+serve = "python -m meddataos.server"
+agent = "python examples/agent.py"
+notes = "python -m meddataos.specialists.notes.serve"
+imaging = "python -m meddataos.specialists.imaging.serve"
+test = "pytest tests"
+
+############################################## STYLE ###############################################
+# Style covers datactrl and the server. Specialists are not in this gate yet.
+# See configs/ruff.toml for the configuration.
+
+[feature.style.pypi-dependencies]
+pytest = ">=8.0.0,<10"
+ruff = ">=0.4.4"
+mypy = ">=1.15.0,<2"
+
+[feature.style.tasks]
+ruff-check.cmd = ["ruff", "check", "src/meddataos/datactrl", "src/meddataos/server"]
+ruff-check.description = "Run ruff check"
+ruff-format.cmd = ["ruff", "format", "--check", "src/meddataos/datactrl", "src/meddataos/server"]
+ruff-format.description = "Check ruff format"
+type-check.cmd = ["mypy", "-p", "meddataos.datactrl", "-p", "meddataos.server"]
+type-check.description = "Run mypy type check"
+qc.depends-on = ["ruff-format", "ruff-check", "type-check"]
+qc.description = "Quality check: ruff & mypy"
+
+[feature.docs.pypi-dependencies]
+mkdocs-material = ">=9.5,<10"
+
+[feature.docs.tasks]
+docs = { cmd = "mkdocs serve", description = "Serve the docs site" }
+docs-build = { cmd = "mkdocs build --strict", description = "Build the docs site into site/" }
+
+[feature.library.dependencies]
+python = ">=3.13,<3.14"
+
+[feature.library.pypi-dependencies]
+meddataos = { path = ".", editable = true, extras = ["datactrl"] }
