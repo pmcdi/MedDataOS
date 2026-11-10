@@ -1,6 +1,6 @@
 # MedDataOS page
 
-The server in `web/backend` opens one case folder and serves this page. Start it from the project root as the [README](../README.md) describes. The page is the URL printed at startup, with `?patient=` set to the folder name. Optional specialists are registered with `--agents` or `--specialist`; see [Connect an agent](../docs/agents.md).
+The page in `web/` is served by `src/meddataos/server`. Start it from the project root as the [README](../README.md) describes. The page is the URL printed at startup, with `?patient=` set to the folder name. Optional specialists are registered with `--agents` or `--specialist`; see [Connect an agent](../docs/agents.md).
 
 `HOST` and `PORT` in `.env` bind the server. The defaults are `127.0.0.1` and `8080`. When `HOST` is `0.0.0.0` or `::`, the printed URL still uses `127.0.0.1`.
 
@@ -22,7 +22,7 @@ An assistant message that is JSON with `response` and a non-empty `citations` li
 
 Other assistant text is shown as markdown. `Clear` drops the selection on the page. The session remains on the server.
 
-The paperclip accepts `.csv` and `.xlsx`. The server writes the bytes to `data/input/dataset.csv` or `data/input/dataset.xlsx`, replacing the previous upload, and appends `[Uploaded file: <name>]` to the question. The agent sees that line. The file stays out of the case folder, so the med-datactrl tools do not list it. `data/` is gitignored.
+The paperclip accepts `.csv` and `.xlsx`. The server writes the bytes to `data/input/dataset.csv` or `data/input/dataset.xlsx`, replacing the previous upload, and appends `[Uploaded file: <name>]` to the question. The agent sees that line. The file stays out of the case folder, so the datactrl tools do not list it. `data/` is gitignored.
 
 ## Pins
 
