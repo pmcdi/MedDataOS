@@ -14,7 +14,7 @@ One process opens one folder. Chat sessions, pins, review checkboxes, and audit 
 | `configs/agents.toml` | Registers the specialists with the server. |
 | `scripts/stack.py` | Starts the router, specialists, and server together. |
 | `tests/` | `server/`, `datactrl/`, and `specialists/`. |
-| `docs/` | This site's pages. `pixi run docs` serves them. |
+| `docs/` | This site's pages. `pixi run docs` serves them. A push to `main` publishes them to GitHub Pages. |
 
 ## Start
 
