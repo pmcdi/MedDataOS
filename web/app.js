@@ -4,6 +4,10 @@ let ws = null;
 // Session management
 let sessionId = localStorage.getItem('meddata_session_id') || null;
 let isProcessing = false;
+let liveStepState = [];
+let liveStatus = '';
+let liveStartedAt = null;
+let liveTimer = null;
 let attachedFile = null;
 // Sidebar state
 let activePatientId = null;
@@ -25,6 +29,7 @@ const connectionStatus = document.getElementById('connection-status');
 const connectionText = document.getElementById('connection-text');
 const sendBtn = document.getElementById('send-btn');
 const clearBtn = document.getElementById('clear-btn');
+const exportAuditBtn = document.getElementById('export-audit-btn');
 const messageInput = document.getElementById('message-input');
 const attachBtn = document.getElementById('attach-btn');
 const fileInput = document.getElementById('file-input');
@@ -713,19 +718,22 @@ async function switchConversation(patientId, sid) {
     // Clear chat and load history
     chatContainer.innerHTML = '';
     let waiting = false;
+    let live = null;
     try {
         const res = await fetch(`/api/session/${sid}`);
         const data = await res.json();
         if (data.status === 'success' && data.history) {
             data.history.forEach(msg => {
-                addChatMessage(msg.role, msg.content, msg.timestamp);
+                addChatMessage(msg.role, msg.content, msg.timestamp, msg.steps, msg.duration_ms);
             });
             waiting = !!data.processing;
+            live = data;
         }
     } catch (e) {
         console.error('Failed to load session:', e);
     }
     setProcessing(waiting);
+    if (waiting && live) renderLiveSteps(live.steps || [], live.activity, live.elapsed_ms);
     highlightPinnedText();
     updateCitationBadgeStates();
 }
@@ -836,8 +844,9 @@ function handleWebSocketMessage(data) {
             return;
         }
 
+        const steps = Array.isArray(data.steps) ? data.steps : [];
         setProcessing(false);
-        addChatMessage('assistant', data.message, data.timestamp || new Date().toISOString());
+        addChatMessage('assistant', data.message, data.timestamp || new Date().toISOString(), steps, data.duration_ms);
         updateCitationBadgeStates();
         // Refresh sidebar to update conversation preview
         refreshSidebarConversations();
@@ -880,8 +889,16 @@ function handleWebSocketMessage(data) {
         return;
     }
 
-    // tool_call / tool_result are silently consumed — the loading indicator
-    // already tells the user something is happening.
+    if (data.type === 'step') {
+        if (!data.session_id || data.session_id !== sessionId || !isProcessing) return;
+        upsertLiveStep(data);
+        return;
+    }
+
+    if (data.type === 'status') {
+        if (!data.session_id || data.session_id !== sessionId || !isProcessing) return;
+        setLiveStatus(data.label, data.elapsed_ms);
+    }
 }
 
 // Update connection status UI
@@ -901,6 +918,44 @@ function updateSendButton() {
     const hasMessage = messageInput.value.trim().length > 0;
     sendBtn.disabled = !isConnected || isProcessing || !hasMessage;
     attachBtn.disabled = !isConnected || isProcessing;
+    if (exportAuditBtn) {
+        exportAuditBtn.disabled = !sessionId;
+    }
+}
+
+async function exportSessionAudit() {
+    if (!sessionId || !exportAuditBtn) return;
+
+    exportAuditBtn.disabled = true;
+
+    try {
+        const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/audit`);
+        const data = await res.json();
+
+        if (!res.ok || data.status !== 'success') {
+            throw new Error(data.message || 'Could not load audit');
+        }
+
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        const patient = activePatientId || 'patient';
+        const payload = {
+            exported_at: new Date().toISOString(),
+            patient_id: activePatientId,
+            session_id: sessionId,
+            runs: data.runs || [],
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `audit-${patient}-${sessionId.slice(0, 8)}-${stamp}.json`;
+        link.click();
+        URL.revokeObjectURL(link.href);
+    } catch (error) {
+        console.error('Audit export failed:', error);
+        window.alert(error.message || 'Audit export failed');
+    } finally {
+        updateSendButton();
+    }
 }
 
 // Handle file selection
@@ -953,6 +1008,15 @@ function derivedResultText(citation) {
     return result.unit ? `${value} ${result.unit}` : value;
 }
 
+function derivedInputText(item) {
+    if (!item || typeof item !== 'object') return '';
+    const token = item.cite ? String(item.cite) : '';
+    const label = item.label ? String(item.label) : '';
+    const detail = item.detail ? String(item.detail) : '';
+    const head = [token, label].filter(Boolean).join(' ');
+    return detail ? `${head} — ${detail}` : head;
+}
+
 function renderDerivedBlock(citation, compact) {
     if (!citation || citation.kind !== 'derived') return '';
     const parts = [];
@@ -960,16 +1024,16 @@ function renderDerivedBlock(citation, compact) {
     if (resultText) {
         parts.push(`<div class="derived-result${compact ? ' derived-result-compact' : ''}">${escapeHtml(resultText)}</div>`);
     }
+    if (Array.isArray(citation.inputs) && citation.inputs.length) {
+        parts.push(
+            `<ul class="derived-inputs">${citation.inputs.map(item => `<li>${escapeHtml(derivedInputText(item))}</li>`).join('')}</ul>`
+        );
+    }
     if (citation.method) {
         parts.push(`<div class="derived-method">${escapeHtml(citation.method)}</div>`);
     }
     if (!compact && citation.detail) {
         parts.push(`<div class="derived-detail">${escapeHtml(citation.detail)}</div>`);
-    }
-    if (!compact && Array.isArray(citation.inputs) && citation.inputs.length) {
-        parts.push(
-            `<ul class="derived-inputs">${citation.inputs.map(item => `<li>${escapeHtml(String(item))}</li>`).join('')}</ul>`
-        );
     }
     return parts.length ? `<div class="derived-block">${parts.join('')}</div>` : '';
 }
@@ -1198,7 +1262,8 @@ function renderWithCitations(html, citations) {
         const data = encodeURIComponent(JSON.stringify(citation));
         const label = citationLabel(agentBadgeLabels, citation.agent, citation);
         const dateStr = getCitationDate(citation);
-        return `<span class="citation-group"><sup class="citation" data-citation="${data}">${escapeHtml(label)}</sup>${dateStr ? `<span class="citation-date">${dateStr}</span>` : ''}</span>`;
+        const token = String(citation.cite || citation.id || id);
+        return `<span class="citation-group"><sup class="citation" data-citation="${data}">${escapeHtml(label)}<span class="citation-token">${escapeHtml(token)}</span></sup>${dateStr ? `<span class="citation-date">${dateStr}</span>` : ''}</span>`;
     });
 }
 
@@ -1504,21 +1569,56 @@ function showTypingIndicator() {
     const indicator = document.createElement('div');
     indicator.className = 'chat-message assistant typing-indicator';
     indicator.id = 'typing-indicator';
+    liveStepState = [];
+    liveStatus = '';
+    liveStartedAt = Date.now();
     indicator.innerHTML = `
         <div class="message-header">MedDataOS</div>
-        <div class="message-bubble">
-            <div class="message-content typing-dots">
-                <span></span><span></span><span></span>
+        <div class="message-bubble step-live">
+            <div class="step-progress"><span></span></div>
+            <div class="step-head">
+                <span class="step-spinner"></span>
+                <span class="step-activity" id="live-activity">Thinking</span>
+                <span class="step-elapsed" id="live-elapsed">0s</span>
             </div>
+            <div class="step-summary" id="live-summary"></div>
+            <ol class="step-list" id="live-steps"></ol>
         </div>
     `;
     chatContainer.appendChild(indicator);
+    clearInterval(liveTimer);
+    liveTimer = setInterval(tickLiveElapsed, 1000);
     scrollToBottom();
 }
 
 function removeTypingIndicator() {
     const indicator = document.getElementById('typing-indicator');
     if (indicator) indicator.remove();
+    clearInterval(liveTimer);
+    liveTimer = null;
+}
+
+function formatDuration(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '';
+    if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
+    const seconds = Math.round(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`;
+}
+
+function syncLiveClock(elapsedMs) {
+    if (typeof elapsedMs === 'number' && isFinite(elapsedMs)) {
+        liveStartedAt = Date.now() - elapsedMs;
+        tickLiveElapsed();
+    }
+}
+
+function tickLiveElapsed() {
+    const el = document.getElementById('live-elapsed');
+    if (!el || liveStartedAt === null) return;
+    const ms = Date.now() - liveStartedAt;
+    el.textContent = ms < 1000 ? '0s' : formatDuration(ms);
 }
 
 function setProcessing(value) {
@@ -1542,12 +1642,15 @@ async function resyncSession() {
             setProcessing(false);
             return;
         }
-        if (data.processing) return;
+        if (data.processing) {
+            renderLiveSteps(data.steps || [], data.activity, data.elapsed_ms);
+            return;
+        }
 
         const answer = data.history[data.history.length - 1];
         removeTypingIndicator();
         if (answer && answer.role === 'assistant') {
-            addChatMessage('assistant', answer.content, answer.timestamp);
+            addChatMessage('assistant', answer.content, answer.timestamp, answer.steps, answer.duration_ms);
             updateCitationBadgeStates();
         }
         setProcessing(false);
@@ -1590,7 +1693,176 @@ function renderAssistantContent(rawContent) {
     return citations.length > 0 ? renderWithCitations(withWarnings, citations) : withWarnings;
 }
 
-function addChatMessage(role, content, timestamp) {
+function stepStatus(step) {
+    return ['started', 'done', 'error'].includes(step.status) ? step.status : 'started';
+}
+
+function stepSummary(steps, live) {
+    const files = steps.filter(step => (
+        step.kind === 'tool' && (step.cite || step.name === 'fetch' || step.name === 'describe')
+    )).length;
+    const tools = steps.filter(step => step.kind === 'tool').length;
+    const consults = [...new Set(
+        steps.filter(step => step.kind === 'consult' && step.name).map(step => step.name)
+    )];
+    const parts = [];
+
+    if (files === 1) parts.push('1 file read');
+    else if (files > 1) parts.push(`${files} files read`);
+    else if (!live && tools === 1) parts.push('1 tool call');
+    else if (!live && tools > 1) parts.push(`${tools} tool calls`);
+
+    if (consults.length) parts.push(`consulted ${consults.join(', ')}`);
+
+    return parts.join(' · ');
+}
+
+function workedLabel(steps, durationMs) {
+    const time = formatDuration(durationMs);
+    const detail = stepSummary(steps, false);
+    const verb = detail ? 'Worked' : 'Thought';
+    const head = time ? `${verb} for ${time}` : verb;
+    return detail ? `${head} · ${detail}` : head;
+}
+
+function stepKind(step) {
+    if (step.kind === 'agent') return 'Think';
+    if (step.kind === 'consult') return 'Consult';
+    return {
+        discover: 'Discover',
+        fetch: 'Read',
+        describe: 'Describe',
+        links: 'Links',
+        assert_link: 'Link',
+        dicom_tree: 'DICOM',
+        dicom_groups: 'Series',
+    }[step.name] || 'Tool';
+}
+
+function stepTarget(step) {
+    if (step.kind === 'agent') return step.label || '';
+    if (step.kind === 'consult') return step.name || '';
+
+    const prefixes = {
+        discover: 'Discovering the case',
+        describe: 'Describing ',
+        fetch: 'Reading ',
+        links: 'Listing links',
+        assert_link: 'Checking a link',
+        dicom_tree: 'Reading the DICOM tree',
+        dicom_groups: 'Grouping DICOM series',
+    };
+    let label = String(step.label || '');
+    const prefix = prefixes[step.name];
+
+    if (prefix && label.startsWith(prefix)) label = label.slice(prefix.length);
+    label = label.replace(/\.(txt|csv|tsv|xlsx|json|dcm|pdf)$/i, '').trim();
+    if (!label && step.name === 'discover') return 'Case';
+    return label;
+}
+
+function stepCite(step) {
+    const token = step.cite ? String(step.cite) : '';
+    const type = {
+        imaging: 'Imaging',
+        note: 'Note',
+        table: 'Table',
+        file: 'File',
+        derived: 'Derived',
+    }[step.cite_kind] || '';
+
+    const sources = Array.isArray(step.sources) && step.sources.length
+        ? ` from ${step.sources.join(', ')}`
+        : '';
+
+    if (token && type) return `${token} · ${type}${sources}`;
+    return token || type;
+}
+
+function stepRow(step, showKind) {
+    const kind = ['tool', 'consult'].includes(step.kind) ? step.kind : 'tool';
+    const cite = escapeHtml(stepCite(step));
+    const time = stepStatus(step) === 'started' || !(step.duration_ms >= 100)
+        ? ''
+        : formatDuration(step.duration_ms);
+    return `<li class="step step-${stepStatus(step)} step-${kind}" data-step-id="${escapeHtml(String(step.step_id || ''))}">
+        <span class="step-mark"></span>
+        <span class="step-kind">${showKind ? escapeHtml(stepKind(step)) : ''}</span>
+        <span class="step-label">${escapeHtml(stepTarget(step))}</span>
+        <span class="step-cite">${cite}</span>
+        <span class="step-time">${escapeHtml(time)}</span>
+    </li>`;
+}
+
+function stepRows(steps) {
+    let previous = '';
+    return steps.map(step => {
+        const kind = stepKind(step);
+        const showKind = kind !== previous;
+        previous = kind;
+        return stepRow(step, showKind);
+    }).join('');
+}
+
+function renderStepTrace(steps, durationMs) {
+    const label = escapeHtml(workedLabel(steps, durationMs));
+    if (!steps.length) return `<div class="step-trace step-trace-plain">${label}</div>`;
+    return `<details class="step-trace">
+        <summary>${label}</summary>
+        <ol class="step-list">${stepRows(steps)}</ol>
+    </details>`;
+}
+
+function liveActivity() {
+    const running = [...liveStepState].reverse().find(step => stepStatus(step) === 'started');
+    if (running && running.label) return running.label;
+    return liveStatus || 'Thinking';
+}
+
+function paintLiveSteps() {
+    const activity = document.getElementById('live-activity');
+    const summary = document.getElementById('live-summary');
+    const list = document.getElementById('live-steps');
+    if (!list) return;
+    if (activity) activity.textContent = liveActivity();
+    if (summary) summary.textContent = stepSummary(liveStepState, true);
+    const shown = new Set([...list.children].map(item => item.dataset.stepId));
+    list.innerHTML = stepRows(liveStepState);
+    [...list.children].forEach(item => {
+        if (!shown.has(item.dataset.stepId)) item.classList.add('step-new');
+    });
+    list.scrollTop = list.scrollHeight;
+    tickLiveElapsed();
+    scrollToBottom();
+}
+
+function renderLiveSteps(steps, status, elapsedMs) {
+    if (!document.getElementById('typing-indicator')) showTypingIndicator();
+    liveStepState = steps.map(step => ({ ...step }));
+    if (typeof status === 'string') liveStatus = status;
+    syncLiveClock(elapsedMs);
+    paintLiveSteps();
+}
+
+function upsertLiveStep(step) {
+    if (!step.step_id) return;
+    if (!document.getElementById('typing-indicator')) showTypingIndicator();
+    syncLiveClock(step.elapsed_ms);
+    const existing = liveStepState.find(item => item.step_id === step.step_id);
+    if (existing && stepStatus(step) === 'started' && stepStatus(existing) !== 'started') return;
+    if (existing) Object.assign(existing, step);
+    else liveStepState.push(step);
+    paintLiveSteps();
+}
+
+function setLiveStatus(label, elapsedMs) {
+    if (!document.getElementById('typing-indicator')) showTypingIndicator();
+    liveStatus = typeof label === 'string' ? label : '';
+    syncLiveClock(elapsedMs);
+    paintLiveSteps();
+}
+
+function addChatMessage(role, content, timestamp, steps, durationMs) {
     const messageDiv = document.createElement('div');
     messageDiv.className = `chat-message ${role}`;
     const label = role === 'user' ? 'You' : 'MedDataOS';
@@ -1604,10 +1876,15 @@ function addChatMessage(role, content, timestamp) {
         messageContent = escapeHtml(content);
     }
 
+    const stepList = Array.isArray(steps) ? steps : [];
+    const trace = role === 'assistant' && (stepList.length || durationMs >= 1000)
+        ? renderStepTrace(stepList, durationMs)
+        : '';
     const timeStr = timestamp ? formatMessageTime(timestamp) : '';
     messageDiv.innerHTML = `
         <div class="message-header">${escapeHtml(label)}</div>
         <div class="message-bubble">
+            ${trace}
             <div class="message-content">${messageContent}</div>
         </div>
         ${timeStr ? `<span class="message-time">${timeStr}</span>` : ''}
@@ -2585,7 +2862,7 @@ function getCleanSelectionText(sel) {
 
 chatContainer.addEventListener('mouseup', (e) => {
     // Ignore if clicking on citation badges or the pin button itself
-    if (e.target.closest('.citation') || e.target.closest('.text-select-pin')) return;
+    if (e.target.closest('.citation, .text-select-pin, .step-trace, .step-list')) return;
     if (!activePatientId) return;
 
     const sel = window.getSelection();
@@ -2633,6 +2910,9 @@ document.addEventListener('mousedown', (e) => {
 // Event listeners
 sendBtn.addEventListener('click', sendMessage);
 clearBtn.addEventListener('click', clearChat);
+if (exportAuditBtn) {
+    exportAuditBtn.addEventListener('click', exportSessionAudit);
+}
 attachBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', handleFileSelect);
 fileRemove.addEventListener('click', removeFile);
