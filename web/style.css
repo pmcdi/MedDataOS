@@ -2357,6 +2357,199 @@ main {
     cursor: not-allowed;
 }
 
+.btn-about {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-warm);
+    border-radius: var(--radius-sm);
+    padding: 5px 12px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-right: 6px;
+}
+
+.btn-about:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* ─── About panel (connected agent) ───────────────────────────── */
+.about-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1999;
+    background: rgba(26, 22, 18, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+}
+
+.about-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.about-modal {
+    position: fixed;
+    z-index: 2000;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0.96);
+    width: min(640px, 92vw);
+    max-height: 85vh;
+    background: var(--bg-surface);
+    border: 1px solid var(--accent-mid);
+    border-radius: var(--radius);
+    box-shadow: 0 20px 80px rgba(26, 22, 18, 0.25);
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.about-modal.open {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+    pointer-events: auto;
+}
+
+.about-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 18px 20px 14px;
+    background: var(--accent-soft);
+    border-bottom: 1px solid var(--accent-mid);
+    flex-shrink: 0;
+}
+
+.about-title {
+    font-family: var(--serif);
+    font-size: 20px;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin: 0 0 6px;
+}
+
+.about-subtitle {
+    font-family: var(--serif);
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 0;
+    max-width: 480px;
+}
+
+.about-body {
+    overflow-y: auto;
+    padding: 16px 20px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    flex: 1;
+    min-height: 0;
+}
+
+.about-agent-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-panel);
+    overflow: hidden;
+}
+
+.about-connected-body {
+    padding: 12px 14px 8px;
+}
+
+.about-endpoint {
+    word-break: break-all;
+}
+
+.about-muted {
+    font-family: var(--serif);
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 0;
+}
+
+.about-loading,
+.about-error {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding: 8px 4px;
+}
+
+.about-error {
+    color: var(--critical);
+}
+
+.about-specialists {
+    padding: 0 14px 14px;
+    border-top: 1px solid var(--border);
+}
+
+.about-specialists-heading {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-dim);
+    margin: 12px 0 10px;
+}
+
+.about-specialists-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 280px;
+    overflow-y: auto;
+}
+
+.about-specialist-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    background: var(--bg-surface);
+}
+
+.about-specialist-name {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    margin-bottom: 4px;
+}
+
+.about-specialist-url {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--text-dim);
+    word-break: break-all;
+    margin-bottom: 6px;
+}
+
+.about-specialist-desc {
+    font-family: var(--serif);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    margin: 0;
+}
+
 /* ─── Empty State ───────────────────────────────────────────── */
 .empty-state {
     text-align: center;
@@ -2773,28 +2966,6 @@ main {
 }
 
 .citation-modal.flipped .modal-provenance-panel {
-    display: flex;
-}
-
-/* ─── Agent View State ───────────────────────────────────── */
-.citation-modal.agent-view .modal-body,
-.citation-modal.agent-view .modal-summary,
-.citation-modal.agent-view .modal-annotations,
-.citation-modal.agent-view .modal-footer {
-    display: none;
-}
-
-.modal-agent-panel {
-    display: none;
-    flex-direction: column;
-    overflow-y: auto;
-    padding: 24px 28px;
-    background: var(--bg-surface);
-    flex: 1;
-    min-height: 0;
-}
-
-.citation-modal.agent-view .modal-agent-panel {
     display: flex;
 }
 

@@ -48,10 +48,13 @@ const modalPin = document.getElementById('modal-pin');
 const modalTabToggle = document.getElementById('modal-tab-toggle');
 const modalAnnotationText = document.getElementById('modal-annotation-text');
 const modalAnnotationTags = document.getElementById('modal-annotation-tags');
-const modalAgentTab = document.getElementById('modal-agent-tab');
-const modalAgentPanel = document.getElementById('modal-agent-panel');
 const modalProvenance = document.getElementById('modal-provenance');
 const modalProvenancePanel = document.getElementById('modal-provenance-panel');
+const aboutBtn = document.getElementById('about-btn');
+const aboutBackdrop = document.getElementById('about-backdrop');
+const aboutModal = document.getElementById('about-modal');
+const aboutBody = document.getElementById('about-body');
+const aboutClose = document.getElementById('about-close');
 
 // ─── Sidebar: Load Patients ─────────────────────────────────
 function dicomRecord(citation) {
@@ -1123,105 +1126,70 @@ const provenanceSteps = {
     ],
 };
 
-// Agent info for tooltip (per agent type) — model-card style
-const agentInfo = {
-    'clinical_notes': {
-        model: 'Gemini (compile-then-navigate)',
-        modelUrl: '',
-        purpose: 'Answers questions from the clinical notes with verified, span-level citations',
-        input: 'Clinical notes (.txt, and scanned pages when a transcript exists)',
-        output: 'Verified claims with highlighted source quotes and documented discrepancies',
-        method: 'Grounded fact ledger, timeline, and conflict check. Direct reading for small charts.',
-        accuracy: 'Each claim is span-grounded and entailment-checked',
-        paper: 'https://arxiv.org/abs/2512.24601',
-        license: 'N/A',
-        limitations: 'Extraction can miss facts. Inferred dates are approximate. Advisory only.',
-    },
-    'imaging': {
-        model: 'Gemini vision + datactrl preview',
-        modelUrl: null,
-        purpose: 'Describes a single bounded DICOM slice fetched through the datactrl harness',
-        input: 'DICOM series preview (PNG)',
-        output: 'Slice-level findings tied to the cited series, slice, and window',
-        method: 'Deterministic series ranking and slice render, then a vision model on that one slice',
-        accuracy: 'Preview only; not a full study read',
-        paper: null,
-        license: 'Research prototype',
-        limitations: 'One slice, fixed windowing, no segmentation model. Not a diagnostic report.',
-    },
-    'chest_xray': {
-        model: 'TorchXRayVision',
-        modelUrl: 'https://huggingface.co/torchxrayvision/densenet121-res224-all',
-        purpose: 'Detects and classifies thoracic pathologies on frontal chest radiographs',
-        input: 'Frontal chest X-ray (PNG)',
-        output: '18 pathology classifications: atelectasis, cardiomegaly, effusion, infiltration, pneumothorax, and others',
-        method: 'DenseNet-121 multi-label classifier trained on 700k+ images from 6 merged public datasets',
-        accuracy: 'AUC 0.84 (18 pathologies)',
-        paper: 'https://arxiv.org/abs/2111.00595',
-        license: 'Apache 2.0',
-        limitations: 'Reduced accuracy on lateral views and portable/bedside radiographs. May miss subtle nodules <1 cm.',
-    },
-    'ecg': {
-        model: 'ECG-FM',
-        modelUrl: 'https://huggingface.co/wanglab/ecg-fm',
-        purpose: 'Interprets 12-lead ECG waveforms for rhythm, conduction, and structural abnormalities',
-        input: '12-lead ECG (HL7 aECG \u2192 SVG)',
-        output: 'Rhythm classification, multi-label diagnostic statements, LVEF prediction',
-        method: 'Transformer foundation model pretrained on 1.3M ECGs via self-supervised learning',
-        accuracy: 'AUC 0.93\u20130.99',
-        paper: 'https://arxiv.org/abs/2408.05178',
-        license: 'MIT',
-        limitations: 'May miss subtle arrhythmias or pacemaker-related artifacts. Not validated for pediatric ECGs.',
-    },
-    'heart_sounds': {
-        model: 'Eko EFAST',
-        modelUrl: 'https://www.ekohealth.com/blogs/newsroom/fda-clearance-efast-sensora',
-        purpose: 'Screens for structural heart murmurs and atrial fibrillation from auscultation recordings',
-        input: 'Heart sound recording (WAV)',
-        output: 'Murmur detection (present/absent, timing, character), atrial fibrillation detection',
-        method: 'Masked autoencoder foundation model trained on 4M+ de-identified recordings',
-        accuracy: '86% sens / 84% spec',
-        paper: null,
-        license: 'Proprietary',
-        limitations: 'Performance degrades with ambient noise or poor stethoscope contact. May not detect low-grade (1/6) murmurs.',
-    },
-    'echo': {
-        model: 'EchoNet-Dynamic',
-        modelUrl: 'https://echonet.github.io/dynamic/',
-        purpose: 'Estimates left ventricular ejection fraction and detects systolic dysfunction from echo video',
-        input: 'Apical 4-chamber echocardiogram (MP4)',
-        output: 'LV ejection fraction estimation, LV segmentation, beat-to-beat cardiac function tracking',
-        method: 'Video-based 3D CNN (R2+1D ResNet) with semantic segmentation, trained on 10k+ studies',
-        accuracy: 'AUC 0.97 (EF MAE 4.1%)',
-        paper: 'https://www.nature.com/articles/s41586-020-2145-8',
-        license: 'Stanford Non-Commercial',
-        limitations: 'Optimized for apical 4-chamber view only. Accuracy decreases with poor acoustic windows or foreshortened views.',
-    },
-    'lab_results': {
-        model: 'Rule-based + Gemini 3.1 Pro',
-        modelUrl: null,
-        purpose: 'Flags abnormal values, identifies trends, and interprets clinical significance of lab panels',
-        input: 'Structured lab results (HL7v2 \u2192 PNG chart)',
-        output: 'Abnormal value flags, delta checks, critical value alerts, longitudinal trend analysis',
-        method: 'Reference range engine with delta checks + LLM-based clinical interpretation',
-        accuracy: 'Rule-based',
-        paper: null,
-        license: 'Proprietary',
-        limitations: 'Reference ranges may not account for age/sex/ethnicity-specific norms. LLM interpretation requires clinical verification.',
-    },
-    'medication': {
-        model: 'DrugBank + Gemini 3.1 Pro',
-        modelUrl: 'https://go.drugbank.com/',
-        purpose: 'Reviews medication lists for drug interactions, contraindications, and dosing concerns',
-        input: 'Medication history (CSV)',
-        output: 'Drug-drug interactions, contraindication flags, dosing timeline, regimen classification',
-        method: 'Curated pharmaceutical knowledge base (500k+ products) with LLM reasoning layer',
-        accuracy: 'Knowledge-base',
-        paper: null,
-        license: 'CC BY-NC 4.0',
-        limitations: 'May not reflect most recent FDA labeling changes. Does not account for patient-specific pharmacogenomics.',
-    },
-};
+function renderConnectedAgentHTML(data) {
+    const url = data.url ? escapeHtml(data.url) : 'Not configured';
+    const model = data.model
+        ? escapeHtml(data.model)
+        : '<span class="about-muted">Not set — MedDataOS sends an empty model field</span>';
+
+    const specialists = Array.isArray(data.specialists) ? data.specialists : [];
+    let specialistsHTML = '';
+    if (specialists.length) {
+        const cards = specialists.map(spec => `
+            <li class="about-specialist-card">
+                <div class="about-specialist-name">${escapeHtml(spec.name || '')}</div>
+                <div class="about-specialist-url">${escapeHtml(spec.url || '')}</div>
+                <p class="about-specialist-desc">${escapeHtml(spec.description || '')}</p>
+            </li>
+        `).join('');
+        specialistsHTML = `
+            <div class="about-specialists">
+                <div class="about-specialists-heading">Specialists</div>
+                <ul class="about-specialists-list">${cards}</ul>
+            </div>
+        `;
+    } else {
+        specialistsHTML = '<p class="about-muted">No specialists registered (router only).</p>';
+    }
+
+    return `
+        <section class="about-agent-card">
+            <div class="agent-info-tooltip-body about-connected-body">
+                <div class="agent-info-tooltip-row">
+                    <span class="agent-info-tooltip-label">Router</span>
+                    <span class="agent-info-tooltip-value about-endpoint">${url}</span>
+                </div>
+                <div class="agent-info-tooltip-row">
+                    <span class="agent-info-tooltip-label">Model</span>
+                    <span class="agent-info-tooltip-value">${model}</span>
+                </div>
+            </div>
+            ${specialistsHTML}
+        </section>
+    `;
+}
+
+async function openAboutPanel() {
+    aboutBackdrop.classList.add('open');
+    aboutModal.classList.add('open');
+    aboutBody.innerHTML = '<div class="about-loading">Loading\u2026</div>';
+    try {
+        const res = await fetch('/api/agent');
+        const data = await res.json();
+        if (!res.ok) {
+            aboutBody.innerHTML = `<div class="about-error">${escapeHtml(data.error || 'Could not load agent info.')}</div>`;
+            return;
+        }
+        aboutBody.innerHTML = renderConnectedAgentHTML(data);
+    } catch {
+        aboutBody.innerHTML = '<div class="about-error">Could not load agent info.</div>';
+    }
+}
+
+function closeAboutPanel() {
+    aboutBackdrop.classList.remove('open');
+    aboutModal.classList.remove('open');
+}
 
 // Extract data date for a citation from active patient's data_dates
 function getCitationDate(citation) {
@@ -2253,60 +2221,7 @@ async function openCitationModal(citation, pin = null, focusSpanUrl = null) {
         modalPin.style.display = 'none';
     }
 
-    // ── Agent info panel ──────────────────────────────────
-    const info = agentInfo[citation.agent];
-    if (info) {
-        const paperHTML = info.paper
-            ? `<a href="${escapeHtml(info.paper)}" target="_blank" rel="noopener" class="agent-model-link">${info.paper.includes('arxiv') ? 'arXiv' : 'Paper'} &#x2197;</a>`
-            : 'N/A';
-        modalAgentPanel.innerHTML = `
-            <div class="agent-info-tooltip-body">
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Model</span>
-                    <span class="agent-info-tooltip-value">${info.modelUrl ? `<a href="${escapeHtml(info.modelUrl)}" target="_blank" rel="noopener" class="agent-model-link">${escapeHtml(info.model)} &#x2197;</a>` : escapeHtml(info.model)}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Purpose</span>
-                    <span class="agent-info-tooltip-value">${escapeHtml(info.purpose)}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Input</span>
-                    <span class="agent-info-tooltip-value">${escapeHtml(info.input)}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Output</span>
-                    <span class="agent-info-tooltip-value">${escapeHtml(info.output)}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Method</span>
-                    <span class="agent-info-tooltip-value">${escapeHtml(info.method)}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Accuracy</span>
-                    <span class="agent-info-tooltip-value">${escapeHtml(info.accuracy)}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Paper</span>
-                    <span class="agent-info-tooltip-value">${paperHTML}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">License</span>
-                    <span class="agent-info-tooltip-value">${escapeHtml(info.license)}</span>
-                </div>
-                <div class="agent-info-tooltip-row">
-                    <span class="agent-info-tooltip-label">Limits</span>
-                    <span class="agent-info-tooltip-value">${escapeHtml(info.limitations)}</span>
-                </div>
-            </div>
-            <div class="agent-info-tooltip-disclaimer">Advisory only — verify clinically</div>
-        `;
-        modalAgentTab.style.display = '';
-    } else {
-        modalAgentTab.style.display = 'none';
-    }
-
     document.querySelector('.modal-tab[data-tab="provenance"]').style.display = '';
-    document.querySelector('.modal-tab[data-tab="agent"]').style.display = '';
     modalAnnotationTags.parentElement.style.display = '';
 
     // ── Footer provenance ──────────────────────────────────
@@ -2564,15 +2479,11 @@ function closeCitationModal() {
     citationBackdrop.classList.remove('open');
     citationModal.classList.remove('open');
     citationModal.classList.remove('flipped');
-    citationModal.classList.remove('agent-view');
     citationModal.style.height = '';
-    // Reset tabs to data
     modalTabToggle.querySelectorAll('.modal-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'data'));
-    // Stop any playing media
     modalBody.querySelectorAll('video, audio').forEach(el => { el.pause(); el.src = ''; });
     modalBody.innerHTML = '';
     modalProvenancePanel.innerHTML = '';
-    modalAgentPanel.innerHTML = '';
     currentModalPin = null;
 }
 
@@ -2604,20 +2515,16 @@ modalPin.addEventListener('click', async () => {
     }
 });
 
-// Tab toggle — switch between data, provenance, and agent views
+// Tab toggle — switch between data and provenance views
 modalTabToggle.addEventListener('click', (e) => {
     const tab = e.target.closest('.modal-tab');
     if (!tab || !modalCitation) return;
     const target = tab.dataset.tab;
-    // Lock height before toggling to prevent jump
     if (target !== 'data' && !citationModal.style.height) {
         citationModal.style.height = citationModal.offsetHeight + 'px';
     }
     citationModal.classList.toggle('flipped', target === 'provenance');
-    citationModal.classList.toggle('agent-view', target === 'agent');
-    // Update active tab
     modalTabToggle.querySelectorAll('.modal-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === target));
-    // Build provenance content on first flip
     if (target === 'provenance' && !modalProvenancePanel.innerHTML) {
         modalProvenancePanel.innerHTML = buildProvenanceHTML(modalCitation);
     }
@@ -2631,10 +2538,13 @@ document.addEventListener('keydown', (e) => {
         closeLightbox();
         return;
     }
+    if (e.key === 'Escape' && aboutModal.classList.contains('open')) {
+        closeAboutPanel();
+        return;
+    }
     if (e.key === 'Escape' && citationModal.classList.contains('open')) {
-        if (citationModal.classList.contains('flipped') || citationModal.classList.contains('agent-view')) {
+        if (citationModal.classList.contains('flipped')) {
             citationModal.classList.remove('flipped');
-            citationModal.classList.remove('agent-view');
             citationModal.style.height = '';
             modalTabToggle.querySelectorAll('.modal-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'data'));
         } else {
@@ -2642,6 +2552,10 @@ document.addEventListener('keydown', (e) => {
         }
     }
 });
+
+aboutBtn.addEventListener('click', () => openAboutPanel());
+aboutClose.addEventListener('click', closeAboutPanel);
+aboutBackdrop.addEventListener('click', closeAboutPanel);
 
 // Image lightbox
 let lightboxEl = null;

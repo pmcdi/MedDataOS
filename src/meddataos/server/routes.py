@@ -261,6 +261,17 @@ async def health():
     }
 
 
+@router.get("/api/agent")
+async def agent_endpoint():
+    """The connected router URL, model name, and registered specialists."""
+    if not state.agent_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "No agent URL configured"},
+        )
+    return dispatch.agent_endpoint_info()
+
+
 UPLOAD_TYPES = (".csv", ".xlsx")
 
 

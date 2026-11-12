@@ -139,6 +139,32 @@ def test_page_is_served(server):
         assert b"MedDataOS" in response.read()
 
 
+def test_agent_endpoint_describes_the_connected_router(server):
+    payload = get(server, "/api/agent")
+    assert payload["url"] == "http://127.0.0.1:9/v1"
+    assert "model" in payload
+    assert payload["specialists"] == []
+
+
+def test_agent_endpoint_lists_registered_specialists(case_folder, tmp_path):
+    config = tmp_path / "agents.toml"
+    config.write_text(
+        """
+[notes]
+url = "http://127.0.0.1:8002/v1"
+description = "Clinical notes specialist."
+
+[imaging]
+url = "http://127.0.0.1:8003/v1"
+description = "DICOM slice specialist."
+""".strip()
+    )
+    with running_server(case_folder, agents_file=str(config)) as running:
+        payload = get(running, "/api/agent")
+        assert [item["name"] for item in payload["specialists"]] == ["imaging", "notes"]
+        assert payload["specialists"][0]["url"] == "http://127.0.0.1:8003/v1"
+
+
 def test_a_case_without_dicom_has_no_previews(server):
     assert get(server, "/api/dicom/previews") == []
     request = urllib.request.Request(

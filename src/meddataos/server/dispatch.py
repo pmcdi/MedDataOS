@@ -273,6 +273,24 @@ class AgentClient:
         return f"{self.url} answered {exc.code}" + (f": {detail}" if detail else "")
 
 
+def agent_endpoint_info() -> dict:
+    """What the page can show about the router at --agent-url."""
+    client = AgentClient.from_env()
+    specialists = [
+        {
+            "name": name,
+            "url": spec.url,
+            "description": spec.description,
+        }
+        for name, spec in sorted(state.specialists.items())
+    ]
+    return {
+        "url": state.agent_url or "",
+        "model": client.model or "",
+        "specialists": specialists,
+    }
+
+
 class Conversation:
     """Messages exchanged with the agent for one piece of work, including tool calls."""
 
