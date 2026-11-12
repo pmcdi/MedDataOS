@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MedDataOS - Medical Data Operating System</title>
-    <link rel="stylesheet" href="/static/style.css?v=76">
+    <link rel="stylesheet" href="/static/style.css?v=77">
 </head>
 <body>
     <div class="container">
@@ -33,6 +33,7 @@
                         <span id="connection-status" class="status disconnected"></span>
                         <span id="connection-text">Disconnected</span>
                     </div>
+                    <button id="about-btn" class="btn-about" type="button" title="Connected agent model">About</button>
                     <button id="insights-toggle" class="btn-insights-toggle" title="Toggle insights panel">
                         <span class="toggle-icon">&#x1F4CC;</span>
                     </button>
@@ -114,7 +115,6 @@
             <div class="modal-tab-toggle" id="modal-tab-toggle">
                 <button class="modal-tab active" data-tab="data">Data</button>
                 <button class="modal-tab" data-tab="provenance">Provenance</button>
-                <button class="modal-tab" data-tab="agent" id="modal-agent-tab">Agent</button>
             </div>
             <div class="modal-actions">
                 <button class="btn-pin" id="modal-pin" title="Pin citation">&#x1F4CC;</button>
@@ -128,13 +128,24 @@
         </div>
         <div class="modal-footer" id="modal-provenance"></div>
         <div class="modal-provenance-panel" id="modal-provenance-panel"></div>
-        <div class="modal-agent-panel" id="modal-agent-panel"></div>
+    </div>
+
+    <div id="about-backdrop" class="about-backdrop"></div>
+    <div id="about-modal" class="about-modal" role="dialog" aria-labelledby="about-title">
+        <div class="about-header">
+            <div>
+                <h2 id="about-title" class="about-title">Connected agent</h2>
+                <p class="about-subtitle">Router endpoint, model name, and specialists registered at server startup.</p>
+            </div>
+            <button type="button" class="modal-close" id="about-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="about-body" id="about-body"></div>
     </div>
 
     <!-- Markdown rendering -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
 
-    <script src="/static/app.js?v=87"></script>
+    <script src="/static/app.js?v=88"></script>
 </body>
 </html>
