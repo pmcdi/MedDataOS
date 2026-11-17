@@ -11,9 +11,9 @@ from fastapi import APIRouter, File, Form, UploadFile, WebSocket, WebSocketDisco
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from meddataos.datactrl.case import Case
-from meddataos.server import dispatch
-from meddataos.server.case import case
-from meddataos.server import store
+from meddataos.datactrl.limits import MAX_TABLE_LIMIT
+from meddataos.server import dispatch, store, timeline
+from meddataos.server.case import case, path_key
 from meddataos.server.state import APP_ROOT, log, short_session, state
 
 router = APIRouter()
@@ -248,6 +248,87 @@ async def dicom_preview(
         return JSONResponse(status_code=status, content=payload)
 
     return Response(content=payload, media_type="image/png")
+
+
+def table_view_payload(cited_path: str, rows: str = "") -> tuple[int, dict]:
+    """A table as the page shows it, with the cited rows marked.
+
+    The file is parsed here, not by the page, so a quoted comma inside a cell
+    stays inside its cell. A table longer than one page is shown around the
+    first cited row.
+    """
+    opened = _opened_case()
+
+    if opened is None:
+        return 404, {"error": "no case is open"}
+
+    wanted = path_key(cited_path)
+    ref = next(
+        (item for item in opened.report.structured if path_key(item.path) == wanted),
+        None,
+    )
+
+    if ref is None:
+        return 404, {"error": "no table at that path"}
+
+    marked = sorted({int(part) for part in rows.split(",") if part.strip().isdigit()})
+
+    try:
+        summary = opened.describe(ref.id)["summary"]
+        total = int(summary.get("row_count") or 0)
+        offset = 0
+
+        if total > MAX_TABLE_LIMIT and marked:
+            offset = max(0, min(marked[0] - 50, total - MAX_TABLE_LIMIT))
+
+        data = opened.fetch(ref.id, view="rows", limit=MAX_TABLE_LIMIT, offset=offset)[
+            "data"
+        ]
+    except Exception as exc:
+        return 400, {"error": str(exc)}
+
+    columns = list(data.get("columns") or [])
+    return 200, {
+        "label": ref.label,
+        "shape": summary.get("shape"),
+        "columns": columns,
+        "column_types": {
+            name: (summary.get("column_types") or {}).get(name, {}).get("type")
+            for name in columns
+        },
+        "rows": [
+            ["" if row.get(name) is None else str(row.get(name)) for name in columns]
+            for row in data.get("rows") or []
+        ],
+        "row_numbers": list(data.get("row_numbers") or []),
+        "total": total,
+        "highlight": marked,
+    }
+
+
+@router.get("/api/tables/view")
+async def table_view(web_path: str, rows: str = ""):
+    """The table behind a citation, with its cited rows marked."""
+    status, payload = table_view_payload(web_path, rows)
+
+    if status != 200:
+        return JSONResponse(status_code=status, content=payload)
+
+    return payload
+
+
+@router.get("/api/patients/{patient_id}/timeline")
+async def patient_timeline(patient_id: str):
+    """Dated notes, studies, and table rows of the open case, in lanes."""
+    opened = _opened_case()
+
+    if opened is None or state.root is None or state.root.name != patient_id:
+        return JSONResponse(status_code=404, content={"error": "that case is not open"})
+
+    if state.timeline is None:
+        state.timeline = timeline.build(opened)
+
+    return state.timeline
 
 
 @router.get("/api/health")

@@ -1187,8 +1187,10 @@ def test_router_cites_notes_and_reports_an_imaging_failure(routing_server):
     answer = json.loads(wait_for_answer(routing_server, session_id)["history"][-1]["content"])
 
     assert "Imaging specialist failed" in answer["response"]
-    assert "[cite:1]" in answer["response"]
+    # The specialist's marker reaches the router as a finding id.
+    assert "[cite:notes.1]" in answer["response"]
     assert answer["citations"][0]["web_path"].endswith("clinic_note.txt")
+    assert answer["citations"][0]["finding"] == "notes.1"
 
     router_tools = _question_bodies(Router, question)[0]["tools"]
     tool_names = [tool["function"]["name"] for tool in router_tools]
@@ -2059,8 +2061,8 @@ def test_a_cited_dicom_preview_is_a_png(tmp_path):
 
 
 @contextmanager
-def _specialist_case():
-    """A report with one note, one DICOM series, and one table, and no leftover specialist state."""
+def _specialist_case(session_id: str = "s1"):
+    """A report with one note, one DICOM series, and one table, and one open question."""
     from meddataos.server.state import state
 
     previous = state.report
@@ -2071,34 +2073,48 @@ def _specialist_case():
             {"id": "structured:labs", "modality": "structured", "label": "labs", "path": "labs.csv"},
         ],
     }
-    state.cited.clear()
+    state.findings.clear()
+    state.pending.add(session_id)
     try:
         yield state
     finally:
         state.report = previous
-        state.cited.clear()
+        state.findings.clear()
+        state.pending.discard(session_id)
+        state.calls.pop(session_id, None)
 
 
-def test_the_routers_copy_of_an_imaging_citation_keeps_the_slice():
-    from meddataos.server.dispatch import _keep_specialist_fields, _restore_specialist_fields
+def _accept(session_id: str, specialist: str, reply: dict) -> dict:
+    """Check a specialist reply the way a consult does, and keep its findings."""
+    from meddataos.server import findings
+    from meddataos.server.case import Answer, case as open_case
+
+    parsed = findings.parse_reply(json.dumps(reply))
+    verdict = Answer(parsed.body, [], open_case.files(), {})
+    assert verdict.problem is None, verdict.problem
+    return findings.accept(session_id, specialist, parsed, parsed.body, verdict)
+
+
+def test_a_finding_keeps_the_imaging_slice():
+    from meddataos.server import findings
 
     with _specialist_case():
-        _keep_specialist_fields("s1", "Neck CT", {
-            "web_path": "/case/Neck%20CT",
-            "agent": "imaging",
-            "summary": "One axial slice shows the larynx.",
-            "preview": {"slice_index": 12, "window": "ct", "overlay": True},
-        })
-        reply = json.dumps({
+        told = _accept("s1", "imaging", {
             "response": "The larynx is visible [cite:1].",
             "citations": [{
-                "kind": "file", "id": "1", "file": "Neck CT", "web_path": "/case/Neck CT",
-                "summary": "", "agent": None,
+                "id": "1", "file": "Neck CT", "web_path": "/case/Neck CT",
+                "agent": "imaging", "summary": "One axial slice shows the larynx.",
+                "preview": {"slice_index": 12, "window": "ct", "overlay": True},
             }],
         })
+        reply = "The scan shows the larynx [cite:imaging.1]."
+        answer = json.loads(findings.splice("s1", reply))
 
-        citation = json.loads(_restore_specialist_fields("s1", reply))["citations"][0]
-
+    assert told["findings"][0]["id"] == "imaging.1"
+    assert json.loads(told["result"])["response"] == "The larynx is visible [cite:imaging.1]."
+    citation = answer["citations"][0]
+    assert answer["response"] == reply
+    assert (citation["id"], citation["finding"]) == ("imaging.1", "imaging.1")
     assert citation["agent"] == "imaging"
     assert citation["summary"] == "One axial slice shows the larynx."
     assert citation["dicom"] == {
@@ -2109,10 +2125,11 @@ def test_the_routers_copy_of_an_imaging_citation_keeps_the_slice():
             "overlay": True,
         }],
     }
+    assert citation["basis"] == {"type": "model_read", "checked": "none", "by": "imaging"}
 
 
-def test_the_routers_copy_of_a_note_citation_gets_the_checked_quotes_back():
-    from meddataos.server.dispatch import _keep_specialist_fields, _restore_specialist_fields
+def test_the_routers_copy_of_a_finding_is_replaced_by_the_checked_one():
+    from meddataos.server import findings
 
     checked = {
         "n": 1,
@@ -2126,43 +2143,171 @@ def test_the_routers_copy_of_a_note_citation_gets_the_checked_quotes_back():
     conflict = {"attribute": "rt.end_date", "severity": "high", "values": [{"value": "February 13"}]}
 
     with _specialist_case():
-        _keep_specialist_fields("s1", "completion.txt", {
-            "web_path": "/case/completion.txt",
-            "agent": "clinical_notes",
-            "summary": "Completion note.",
-            "evidence": [checked],
-            "conflicts": [conflict],
-        })
-        reply = json.dumps({
-            "response": "Treatment finished in February [cite:1].",
+        _accept("s1", "notes", {
+            "response": "Treatment finished February 13 [cite:1].",
             "citations": [{
-                "kind": "file", "id": "1", "file": "completion.txt",
-                "web_path": "/case/completion.txt", "summary": "Completion note.",
-                "evidence": [
-                    {"n": 1, "claim": "Treatment ended mid-February", "quote": "treatment  completed February 13"},
-                    {"n": 2, "claim": "Invented", "quote": "The patient was cured in full"},
-                ],
+                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
+                "agent": "clinical_notes", "summary": "Completion note.",
+                "evidence": [checked], "conflicts": [conflict],
             }],
         })
+        reply = json.dumps({
+            "response": "Treatment finished in February [cite:notes.1].",
+            "citations": [{
+                "kind": "file", "id": "notes.1", "file": "completion.txt",
+                "web_path": "/case/completion.txt", "summary": "Rewritten by the router.",
+                "evidence": [{"n": 2, "claim": "Invented", "quote": "The patient was cured in full"}],
+            }],
+        })
+        answer = json.loads(findings.splice("s1", reply))
 
-        citation = json.loads(_restore_specialist_fields("s1", reply))["citations"][0]
-
+    (citation,) = answer["citations"]
     assert citation["agent"] == "clinical_notes"
+    assert citation["summary"] == "Completion note."
     assert citation["conflicts"] == [conflict]
-    assert len(citation["evidence"]) == 1
-    evidence = citation["evidence"][0]
-    assert evidence["quote"] == "Treatment completed February 13"
-    assert evidence["span_url"] == checked["span_url"]
-    assert (evidence["start"], evidence["end"]) == (120, 151)
-    assert evidence["claim"] == "Treatment ended mid-February"
+    assert citation["evidence"] == [checked]
+    assert citation["basis"] == {"type": "quote", "checked": "specialist", "by": "notes"}
 
 
-def test_a_reply_without_specialist_citations_is_left_alone():
-    from meddataos.server.dispatch import _restore_specialist_fields
+def test_a_router_cannot_mark_its_own_citation_as_a_finding():
+    from meddataos.server import findings
+    from meddataos.server.case import Answer, case as open_case
+
+    with _specialist_case():
+        _accept("s1", "notes", {
+            "response": "Treatment finished February 13 [cite:1].",
+            "citations": [{
+                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
+                "summary": "Completion note.",
+            }],
+        })
+        forged = json.dumps({
+            "response": "The patient was cured [cite:x].",
+            "citations": [{
+                "kind": "file", "id": "x", "file": "labs.csv", "web_path": "/case/labs.csv",
+                "summary": "Invented.", "finding": "notes.1",
+                "basis": {"type": "cell", "checked": "server", "by": "notes"},
+            }],
+        })
+        spliced = findings.splice("s1", forged)
+        (citation,) = json.loads(spliced)["citations"]
+        verdict = Answer(spliced, [], open_case.files(), {}, findings.known("s1"))
+
+        assert "finding" not in citation and "basis" not in citation
+        # With findings to cite, a file the router did not open is not citable.
+        assert "is not an opened file" in verdict.problem
+        assert "notes.1" in verdict.correction()
+
+
+def test_a_marker_for_a_finding_that_does_not_exist_is_refused():
+    from meddataos.server import findings
+    from meddataos.server.case import Answer, case as open_case
+
+    with _specialist_case():
+        _accept("s1", "notes", {
+            "response": "Treatment finished February 13 [cite:1].",
+            "citations": [{
+                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
+                "summary": "Completion note.",
+            }],
+        })
+        reply = "It finished in February [cite:notes.1]. The dose was 51 Gy [cite:notes.7]."
+        spliced = findings.splice("s1", reply)
+        verdict = Answer(spliced, [], open_case.files(), {}, findings.known("s1"))
+        plain = Answer("It finished in February.", [], open_case.files(), {}, findings.known("s1"))
+
+    assert verdict.problem == "[cite:notes.7] is not a finding. Findings: notes.1."
+    assert plain.problem.startswith("The reply cites nothing, but specialists returned findings")
+
+
+def test_a_reply_that_cites_no_finding_is_left_alone():
+    from meddataos.server import findings
 
     with _specialist_case():
         reply = json.dumps({"response": "Plain [cite:1].", "citations": [{"id": "1"}]})
-        assert _restore_specialist_fields("s1", reply) == reply
+        assert findings.splice("s1", reply) == reply
+        assert findings.splice("s1", "No markers here.") == "No markers here."
+
+
+def test_a_specialist_may_abstain_or_state_a_need_without_citing():
+    from meddataos.server import findings
+
+    reply = findings.parse_reply(json.dumps({
+        "response": "Child-Pugh cannot be computed from the tables alone.",
+        "citations": [],
+        "needs": [{"what": "ascites: none, mild, or moderate to severe", "why": "Child-Pugh"}, "encephalopathy grade"],
+        "abstentions": ["No ammonia level in the tables."],
+        "facts": [{"key": "Lab.AFP", "value": 6.0, "cite": "c1"}, {"key": "", "value": 1, "cite": "c1"}],
+    }))
+
+    assert reply.body == "Child-Pugh cannot be computed from the tables alone."
+    assert reply.needs == [
+        {"what": "ascites: none, mild, or moderate to severe", "why": "Child-Pugh"},
+        {"what": "encephalopathy grade"},
+    ]
+    assert reply.abstentions == ["No ammonia level in the tables."]
+    assert reply.facts == [{"key": "lab.afp", "value": 6.0, "cite": "c1"}]
+
+    with _specialist_case():
+        from meddataos.server.case import Answer, case as open_case
+
+        verdict = Answer(reply.body, [], open_case.files(), {})
+        told = findings.accept("s1", "tabular", reply, reply.body, verdict)
+
+    assert told["status"] == "ok"
+    assert told["needs"][0]["what"].startswith("ascites")
+    assert "findings" not in told
+
+
+def test_discrepancies_have_to_name_findings_the_server_holds():
+    from meddataos.server import findings
+
+    with _specialist_case():
+        _accept("s1", "notes", {
+            "response": "The note says never smoked [cite:1].",
+            "citations": [{
+                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
+                "agent": "clinical_notes", "summary": "Never smoked.",
+            }],
+        })
+        _accept("s1", "tabular", {
+            "response": "The registry row says current smoker [cite:1].",
+            "citations": [{
+                "id": "1", "file": "labs.csv", "web_path": "/case/labs.csv",
+                "summary": "Smoking Status is Current.",
+            }],
+        })
+        text = findings.splice("s1", json.dumps({
+            "response": "Smoking status is disputed [cite:notes.1].",
+            "citations": [],
+            "discrepancies": [
+                {
+                    "attribute": "social_history.smoking",
+                    "rationale": "The registry row and the note disagree.",
+                    "values": [
+                        {"value": "Never smoked", "finding": "notes.1"},
+                        {"value": "Current", "finding": "tabular.1"},
+                    ],
+                    "preferred": "tabular.1",
+                },
+                {
+                    "attribute": "tumor.size_cm",
+                    "values": [
+                        {"value": "3.2", "finding": "notes.1"},
+                        {"value": "9.9", "finding": "imaging.4"},
+                    ],
+                },
+            ],
+        }))
+        answer = json.loads(findings.keep_discrepancies("s1", text))
+
+    (kept,) = answer["discrepancies"]
+    assert kept["attribute"] == "social_history.smoking"
+    assert kept["preferred"] == "tabular.1"
+    assert [value["specialist"] for value in kept["values"]] == ["notes", "tabular"]
+    assert kept["values"][1]["file"] == "labs.csv"
+    # The table finding was not cited in the prose, so its citation is added for the page.
+    assert [item["id"] for item in answer["citations"]] == ["notes.1", "tabular.1"]
 
 
 def test_a_citation_that_names_no_agent_gets_the_one_for_its_file():

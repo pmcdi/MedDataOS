@@ -360,6 +360,7 @@ def calls_for_audit(calls: dict[str, dict]) -> list[dict]:
             "web_path": record.get("web_path"),
             "modality": record.get("modality"),
             "file": record.get("file"),
+            "by": record.get("by", "router"),
         })
 
     return found
@@ -385,7 +386,10 @@ def citations_for_audit(message: str) -> list[dict]:
 
         kept.append({
             key: item[key]
-            for key in ("cite", "id", "kind", "web_path", "summary", "agent", "inputs")
+            for key in (
+                "cite", "id", "kind", "web_path", "summary", "agent", "inputs",
+                "finding", "basis",
+            )
             if key in item
         })
 

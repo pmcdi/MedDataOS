@@ -5,12 +5,14 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import quote, unquote, urlparse
 
 from meddataos.datactrl.tools import TOOL_DEFINITIONS, dispatch
+from meddataos.datactrl.utils.table import parse_number
 from meddataos.server import answer
 from meddataos.server.state import log, state
 
@@ -162,6 +164,9 @@ class Case:
 
     def __init__(self) -> None:
         """Expose the datactrl tools the agent may call."""
+        # Specialists are consulted at the same time, and each tool call runs on
+        # a worker thread. One call at a time reads the case and takes a token.
+        self._lock = threading.Lock()
         self.tools = [self._exposed(tool) for tool in TOOL_DEFINITIONS]
         self.tool_names = [tool["function"]["name"] for tool in self.tools]
         self._takes_root = {
@@ -292,8 +297,17 @@ class Case:
     # Tools
     # -----------------------------------------------------------------------
 
-    def run(self, name: str, arguments: dict, session_id: str) -> dict:
-        """Run one tool for a question and remember any file it opened."""
+    def run(
+        self, name: str, arguments: dict, session_id: str, by: str = "router"
+    ) -> dict:
+        """Run one tool for a question and remember any file it opened.
+
+        ``by`` is who asked: ``router``, or the name of a specialist.
+        """
+        with self._lock:
+            return self._run(name, arguments, session_id, by)
+
+    def _run(self, name: str, arguments: dict, session_id: str, by: str) -> dict:
         agent_args = {
             key: value
             for key, value in arguments.items()
@@ -317,7 +331,7 @@ class Case:
         payload = {"status": "ok", "name": name, "result": result}
 
         if name in self._READS:
-            token = self._remember(session_id, name, agent_args, result)
+            token = self._remember(session_id, name, agent_args, result, by)
 
             if token:
                 payload["cite"] = token
@@ -330,7 +344,10 @@ class Case:
     # -----------------------------------------------------------------------
 
     def expand_citations(self, text: str, calls: dict[str, dict]) -> str:
-        """Fill file, web_path, command, DICOM, and note links from each cite token."""
+        """Fill file, web_path, command, DICOM, and note links from each cite token.
+
+        A specialist's finding was filled in when it was accepted and is left alone.
+        """
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
@@ -347,6 +364,9 @@ class Case:
             if not isinstance(citation, dict):
                 continue
 
+            if citation.get("finding"):
+                continue
+
             handle = citation.get("cite")
             call = calls.get(handle) if isinstance(handle, str) else None
 
@@ -358,6 +378,29 @@ class Case:
 
         if not changed:
             return text
+
+        return json.dumps(parsed)
+
+    def stamp_basis(self, text: str, calls: dict[str, dict]) -> str:
+        """Say what each of the router's own citations rests on.
+
+        A finding already says so: it was stamped when its specialist answered.
+        """
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
+        citations = parsed.get("citations") if isinstance(parsed, dict) else None
+
+        if not isinstance(citations, list):
+            return text
+
+        for citation in citations:
+            if isinstance(citation, dict) and not citation.get("finding"):
+                handle = citation.get("cite")
+                call = calls.get(handle) if isinstance(handle, str) else None
+                citation["basis"] = Contract.basis(citation, call, "router")
 
         return json.dumps(parsed)
 
@@ -415,7 +458,12 @@ class Case:
     # -----------------------------------------------------------------------
 
     def _remember(
-        self, session_id: str, tool: str, agent_args: dict, result: dict
+        self,
+        session_id: str,
+        tool: str,
+        agent_args: dict,
+        result: dict,
+        by: str = "router",
     ) -> str | None:
         """Remember a read and return its cite token, or None."""
         if session_id not in state.pending:
@@ -429,10 +477,13 @@ class Case:
         if ref is None:
             return None
 
-        opened = state.reads.setdefault(session_id, [])
+        # Only the router's own reads count as files it opened. What a specialist
+        # read reaches the router as a finding.
+        if by == "router":
+            opened = state.reads.setdefault(session_id, [])
 
-        if not any(item["web_path"] == ref["web_path"] for item in opened):
-            opened.append(ref)
+            if not any(item["web_path"] == ref["web_path"] for item in opened):
+                opened.append(ref)
 
         calls = state.calls.setdefault(session_id, {})
         token = f"c{len(calls) + 1}"
@@ -445,7 +496,13 @@ class Case:
             "web_path": ref["web_path"],
             "modality": ref.get("modality") or "",
             "patient_id": state.root.name if state.root is not None else "",
+            "by": by,
         }
+        table = self._call_table(ref, tool, result)
+
+        if table:
+            record["table"] = table
+
         dicom = self._call_dicom(ref, tool, agent_args, result)
 
         if dicom:
@@ -482,6 +539,49 @@ class Case:
         if view == "preview":
             preview = self._dicom_preview(args, result, ref.get("web_path", ""))
             return {"previews": [preview]} if preview else {}
+
+        return {}
+
+    _SERIES_KEYS: ClassVar[tuple[str, ...]] = (
+        "item", "key", "unit", "value_column", "time_column", "points", "stats",
+        "text_values", "other_units", "superseded",
+    )
+
+    @classmethod
+    def _call_table(cls, ref: dict, tool: str, result: dict) -> dict:
+        """What a table fetch returned, so a citation of it can be checked.
+
+        The page draws the chart and the cited cells from this record, not from
+        what the agent wrote.
+        """
+        if ref.get("modality") != "structured" or tool != "fetch":
+            return {}
+
+        view = result.get("view")
+        raw = result.get("data")
+        data = raw if isinstance(raw, dict) else {}
+
+        if view == "rows":
+            numbers = data.get("row_numbers") or []
+            rows = data.get("rows") or []
+            return {
+                "view": "rows",
+                "columns": list(data.get("columns") or []),
+                "rows": {
+                    str(number): row
+                    for number, row in zip(numbers, rows, strict=False)
+                    if isinstance(row, dict)
+                },
+            }
+
+        if view == "series":
+            return {
+                "view": "series",
+                **{key: data[key] for key in cls._SERIES_KEYS if key in data},
+            }
+
+        if view == "score":
+            return {"view": "score", **data}
 
         return {}
 
@@ -736,8 +836,15 @@ class Contract:
                     f"citation cite {handle!r} is not a tool result from this question"
                 )
 
+            cells = Contract._cells_problem(citation, marker, calls[handle])
+
+            if cells:
+                return cells
+
             if citation.get("kind") == "derived":
-                return Contract._derived_inputs_problem(citation, marker, calls)
+                return Contract._derived_inputs_problem(
+                    citation, marker, calls
+                ) or Contract._derived_value_problem(citation, marker, calls)
 
             return None
 
@@ -789,6 +896,226 @@ class Contract:
                 return f"citation {marker} input {token} needs a label for the data used"
 
         return None
+
+    # -----------------------------------------------------------------------
+    # Tables
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _same_cell(given: object, actual: object) -> bool:
+        """Whether a cited value is the value the table holds."""
+        left, right = parse_number(given), parse_number(actual)
+
+        if left is not None and right is not None:
+            return abs(left - right) < 1e-9
+
+        return str(given).strip().casefold() == str(actual).strip().casefold()
+
+    @staticmethod
+    def _series_point(table: dict, row: int) -> dict | None:
+        """The point a series fetch returned for this file row."""
+        for name in ("points", "text_values", "other_units", "superseded"):
+            for point in table.get(name) or []:
+                if isinstance(point, dict) and point.get("row") == row:
+                    return point
+
+        return None
+
+    @staticmethod
+    def _cell(table: dict, cell: dict) -> tuple[dict | None, str | None]:
+        """The checked cell a citation names, or the reason it cannot be used."""
+        row = Contract.as_int(cell.get("row"))
+        column = cell.get("column")
+        given = cell.get("value")
+
+        if row is None:
+            return None, "a cell needs the row number the fetch gave"
+
+        if table.get("view") == "rows":
+            found = (table.get("rows") or {}).get(str(row))
+
+            if not isinstance(found, dict):
+                return None, f"row {row} is not a row that fetch returned"
+
+            name = next(
+                (
+                    key for key in found
+                    if isinstance(column, str)
+                    and key.strip().casefold() == column.strip().casefold()
+                ),
+                None,
+            )
+
+            if name is None:
+                return None, (
+                    f"row {row} has no column {column!r}; "
+                    f"columns: {', '.join(found)}"
+                )
+
+            actual = found[name]
+
+            if actual is None or str(actual).strip() == "":
+                return None, f"row {row} {name} is empty"
+
+            if given is not None and not Contract._same_cell(given, actual):
+                return None, f"row {row} {name} is {actual!r}, not {given!r}"
+
+            return {"row": row, "column": name, "value": actual}, None
+
+        point = Contract._series_point(table, row)
+
+        if point is None:
+            return None, f"row {row} is not a point that series returned"
+
+        reported = point.get("reported")
+        held = [
+            point.get("value"),
+            point.get("text"),
+            reported.get("value") if isinstance(reported, dict) else None,
+        ]
+        held = [value for value in held if value is not None]
+
+        if given is not None and not any(
+            Contract._same_cell(given, value) for value in held
+        ):
+            return None, f"row {row} holds {held[0]!r}, not {given!r}"
+
+        checked = {
+            "row": row,
+            "column": table.get("value_column"),
+            "value": held[0] if held else None,
+            "date": point.get("date"),
+        }
+
+        if point.get("unit"):
+            checked["unit"] = point["unit"]
+
+        return checked, None
+
+    @staticmethod
+    def _cells_problem(citation: dict, marker: str, call: dict) -> str | None:
+        """Why the cells on this citation are not what the call returned, or None."""
+        cells = citation.get("cells")
+
+        if cells is None:
+            return None
+
+        if not isinstance(cells, list):
+            return f"citation {marker} cells must be a list"
+
+        if not cells:
+            return None
+
+        raw = call.get("table")
+        table = raw if isinstance(raw, dict) else {}
+
+        if table.get("view") not in ("rows", "series"):
+            return (
+                f"citation {marker} names cells, but its call is not a rows or "
+                "series fetch of a table"
+            )
+
+        for cell in cells:
+            if not isinstance(cell, dict):
+                return f"citation {marker} cell must be an object"
+
+            _, problem = Contract._cell(table, cell)
+
+            if problem:
+                return f"citation {marker} cell: {problem}"
+
+        return None
+
+    _NOT_VALUES: ClassVar[frozenset[str]] = frozenset({"row", "window_days"})
+
+    @staticmethod
+    def _returned_values(node: object, numbers: list[float], words: set[str]) -> None:
+        """Collect every number and string a table call returned."""
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key not in Contract._NOT_VALUES:
+                    Contract._returned_values(value, numbers, words)
+            return
+
+        if isinstance(node, list):
+            for item in node:
+                Contract._returned_values(item, numbers, words)
+            return
+
+        number = parse_number(node)
+
+        if number is not None:
+            numbers.append(number)
+        elif isinstance(node, str) and node.strip():
+            words.add(node.strip().casefold())
+
+    @staticmethod
+    def returned(value: object, tables: list[dict]) -> bool:
+        """Whether a table call returned this value, allowing for rounding.
+
+        2.78 matches a returned 2.7849. Rounding may not move the value by more
+        than 5 percent, so 3 does not match 2.78. A string has to be one the call
+        returned.
+        """
+        numbers: list[float] = []
+        words: set[str] = set()
+
+        for table in tables:
+            Contract._returned_values(table, numbers, words)
+
+        number = parse_number(value)
+
+        if number is None:
+            return str(value).strip().casefold() in words
+
+        text = str(value).strip()
+        decimals = len(text.split(".", 1)[1]) if "." in text and "e" not in text else 0
+        tolerance = 0.5 * 10 ** -min(decimals, 9) + 1e-9
+
+        def rounds_to(found: float) -> bool:
+            gap = abs(number - found)
+            return gap <= 1e-9 or (gap <= tolerance and gap <= 0.05 * abs(found))
+
+        return any(rounds_to(found) for found in numbers)
+
+    @staticmethod
+    def _derived_value_problem(
+        citation: dict, marker: str, calls: dict[str, dict]
+    ) -> str | None:
+        """A derived value from a table has to be one a table call returned."""
+        tokens = [citation.get("cite")] + [
+            item.get("cite")
+            for item in citation.get("inputs") or []
+            if isinstance(item, dict)
+        ]
+        tables = [
+            calls[token]["table"]
+            for token in dict.fromkeys(tokens)
+            if isinstance(token, str)
+            and isinstance(calls.get(token), dict)
+            and isinstance(calls[token].get("table"), dict)
+        ]
+
+        if not tables:
+            return None
+
+        raw = citation.get("result")
+        value = raw.get("value") if isinstance(raw, dict) else None
+
+        if value is None or str(value).strip() == "":
+            return (
+                f"citation {marker} needs result.value: the value its series or "
+                "score fetch returned"
+            )
+
+        if Contract.returned(value, tables):
+            return None
+
+        return (
+            f"citation {marker} result {value!r} is not a value its call returned. "
+            "A number from a table comes from a series or score fetch (first, "
+            "last, min, max, change, a score), not from arithmetic on cells"
+        )
 
     @staticmethod
     def _notes_problem(
@@ -1032,7 +1359,83 @@ class Contract:
         if call.get("dicom"):
             citation["dicom"] = call["dicom"]
 
+        Contract._fill_table(citation, call)
         Contract._fill_notes(citation, call)
+
+    @staticmethod
+    def _fill_table(citation: dict, call: dict) -> None:
+        """Attach what the table call returned, and the checked value of each cell."""
+        raw = call.get("table")
+
+        if not isinstance(raw, dict) or not raw:
+            return
+
+        cells = []
+
+        for cell in citation.get("cells") or []:
+            if not isinstance(cell, dict):
+                continue
+
+            checked, _ = Contract._cell(raw, cell)
+
+            if checked:
+                cells.append(checked)
+
+        if cells:
+            citation["cells"] = cells
+        else:
+            citation.pop("cells", None)
+
+        if raw.get("view") == "rows":
+            # Only the cited rows travel with the citation; the page loads the
+            # rest of the table from the file.
+            kept = {str(cell["row"]) for cell in cells}
+            rows = raw.get("rows") or {}
+            citation["table"] = {
+                "view": "rows",
+                "columns": raw.get("columns") or [],
+                "rows": {number: rows[number] for number in rows if number in kept},
+            }
+        else:
+            citation["table"] = raw
+
+    @staticmethod
+    def basis(citation: dict, call: dict | None, by: str) -> dict:
+        """What a citation rests on, and who checked it.
+
+        ``type`` is ``quote`` (a passage of a note), ``cell`` (table cells),
+        ``computed`` (a value code worked out), ``model_read`` (a model's
+        description of an image), ``metadata``, or ``file``. ``checked`` is
+        ``server`` when this server compared the claim's evidence with the file,
+        ``specialist`` when only the specialist did, and ``none`` otherwise.
+        """
+        raw = citation.get("dicom")
+        dicom = raw if isinstance(raw, dict) else {}
+        has_quotes = any(
+            isinstance(item, dict) and item.get("quote")
+            for item in citation.get("evidence") or []
+        )
+
+        if citation.get("kind") == "derived":
+            table = call.get("table") if isinstance(call, dict) else None
+            kind, checked = "computed", "server" if table else "none"
+        elif has_quotes:
+            located = isinstance(call, dict) and isinstance(call.get("span"), dict)
+            kind = "quote"
+            checked = "server" if located else "none"
+
+            if not located and by != "router":
+                checked = "specialist"
+        elif citation.get("cells"):
+            kind, checked = "cell", "server"
+        elif dicom.get("previews"):
+            kind, checked = "model_read", "none"
+        elif dicom.get("metadata"):
+            kind, checked = "metadata", "server"
+        else:
+            kind, checked = "file", "none"
+
+        return {"type": kind, "checked": checked, "by": by}
 
     @staticmethod
     def _fill_notes(citation: dict, call: dict) -> None:
@@ -1140,9 +1543,15 @@ class Contract:
 
 
 class Answer:
-    """One agent reply, judged against the files opened for its question."""
+    """One agent reply, judged against the files opened for its question.
+
+    ``findings`` are the ids of what specialists found for this question. A
+    citation the server spliced in for one of them was checked when the
+    specialist answered and is not judged again.
+    """
 
     _UNSET = object()
+    _FINDING_ID = re.compile(r"([a-z][a-z0-9_]{0,31})\.\d+")
 
     # -----------------------------------------------------------------------
     # Judgment
@@ -1154,12 +1563,14 @@ class Answer:
         opened: list[dict],
         known: list[dict],
         calls: dict[str, dict] | None = None,
+        findings: frozenset[str] = frozenset(),
     ) -> None:
         """Keep the reply and the files opened while it was written."""
         self.text = text.strip()
         self.opened = opened
         self.known = known
         self.calls = calls or {}
+        self.findings = findings
         self._problem = self._UNSET
 
     @property
@@ -1199,6 +1610,15 @@ class Answer:
         if names:
             text += " Opened files: " + ", ".join(names)
 
+        if self.findings:
+            text += (
+                " Findings you can cite by id, such as [cite:"
+                + sorted(self.findings)[0]
+                + "]: "
+                + ", ".join(sorted(self.findings))
+                + ". A finding needs no entry in citations."
+            )
+
         return text
 
     @staticmethod
@@ -1211,6 +1631,7 @@ class Answer:
     def _find_problem(self) -> str | None:
         if (
             not self.opened
+            and not self.findings
             and "[cite:" not in self.text
             and '"citations"' not in self.text
         ):
@@ -1226,6 +1647,11 @@ class Answer:
             if "{" in self.text:
                 return (
                     "The reply has text outside the JSON object, or the JSON isinvalid."
+                )
+            if self.findings and not self.opened:
+                return (
+                    "The reply cites nothing, but specialists returned findings. "
+                    "Put [cite:<finding id>] after the words each finding supports."
                 )
             return (
                 "The reply is plain text, but files were opened, so it must be the "
@@ -1248,7 +1674,10 @@ class Answer:
         if not Contract.has_marker(response):
             return "The response has no [cite:id] markers."
 
-        for item in citations:
+        trusted = [item for item in citations if self._is_finding(item)]
+        own = [item for item in citations if not self._is_finding(item)]
+
+        for item in own:
             if not isinstance(item, dict):
                 continue
 
@@ -1261,14 +1690,59 @@ class Answer:
 
         problems = [
             Contract.citation_problem(item, response, self.calls, self._web_paths())
-            for item in citations
+            for item in own
         ]
 
-        if not citations or all(problems):
+        if not trusted and (not own or all(problems)):
             found = "; ".join(item for item in problems if item) or "the list is empty"
             return f"No citation is usable: {found}."
 
-        return Contract.marker_problem(response)
+        return self._unknown_finding(response, own) or Contract.marker_problem(
+            response
+        )
+
+    def _is_finding(self, citation: object) -> bool:
+        return isinstance(citation, dict) and citation.get("finding") in self.findings
+
+    def problem_of(self, citation: object, response: str) -> str | None:
+        """Why this one citation cannot back the reply, or None.
+
+        A reply passes when any citation in it is usable, so one that passed can
+        still hold a citation that is not.
+        """
+        if not isinstance(citation, dict):
+            return "a citation is not an object"
+
+        handle = citation.get("cite")
+        call = self.calls.get(handle) if isinstance(handle, str) else None
+        return answer.shape_problem(citation, call) or Contract.citation_problem(
+            citation, response, self.calls, self._web_paths()
+        )
+
+    def _unknown_finding(self, response: str, own: list) -> str | None:
+        """A marker shaped like a finding id that no specialist returned."""
+        specialists = {name.split(".", 1)[0] for name in self.findings}
+        named = {
+            str(item.get("cite") or item.get("id"))
+            for item in own
+            if isinstance(item, dict)
+        }
+
+        for marker in Contract._MARKER.findall(response):
+            match = self._FINDING_ID.fullmatch(marker)
+
+            if (
+                match
+                and match.group(1) in specialists
+                and marker not in self.findings
+                and marker not in named
+            ):
+                return (
+                    f"[cite:{marker}] is not a finding. "
+                    f"Findings: {', '.join(sorted(self.findings))}."
+                )
+
+        return None
 
     def _is_json_object(self) -> bool:
         try:
@@ -1283,6 +1757,12 @@ class Answer:
         """
         fetched = {path_key(call.get("web_path")) for call in self.calls.values()}
         source = self.opened or self.known
+
+        if self.findings and not self.opened:
+            # Specialists read the files. The router cites their findings, not a
+            # file it did not open.
+            source = []
+
         return {
             path_key(item.get("web_path")): item["web_path"]
             for item in source
