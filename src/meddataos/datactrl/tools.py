@@ -81,6 +81,77 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "limit": {"type": "integer"},
             "offset": {"type": "integer"},
             "columns": {"type": "array", "items": {"type": "string"}},
+            "where": {
+                "type": "array",
+                "description": (
+                    "Table rows view: conditions a row must pass, such as "
+                    '[{"column": "test", "op": "eq", "value": "AFP"}]. '
+                    "op is eq, ne, gt, ge, lt, le, contains, or in."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "column": {"type": "string"},
+                        "op": {"type": "string"},
+                        "value": {},
+                    },
+                    "required": ["column", "value"],
+                },
+            },
+            "order_by": {
+                "type": "string",
+                "description": (
+                    "Table rows view: column to sort by; prefix - for descending"
+                ),
+            },
+            "item": {
+                "type": "string",
+                "description": (
+                    "Table series view, shape long: the test to read over time, "
+                    "by name, key such as lab.afp, or LOINC code"
+                ),
+            },
+            "column": {
+                "type": "string",
+                "description": (
+                    "Table series view, shape wide: the numeric column to read "
+                    "over time, such as weight_kg"
+                ),
+            },
+            "from_date": {
+                "type": "string",
+                "description": "Table series view: first date, YYYY-MM-DD",
+            },
+            "to_date": {
+                "type": "string",
+                "description": "Table series view: last date, YYYY-MM-DD",
+            },
+            "name": {
+                "type": "string",
+                "description": (
+                    "Table score view: child_pugh, albi, meld, fib4, bmi, or interval"
+                ),
+            },
+            "at": {
+                "type": "string",
+                "description": (
+                    "Table score view: use the draw nearest this date, YYYY-MM-DD "
+                    "(default: the latest draw)"
+                ),
+            },
+            "inputs": {
+                "type": "object",
+                "description": (
+                    "Table score view: values the table does not hold, by input "
+                    'name, such as {"ascites": "none", "encephalopathy": "none"}'
+                ),
+            },
+            "window_days": {
+                "type": "integer",
+                "description": (
+                    "Table score view: how many days from at a draw may be (default 14)"
+                ),
+            },
             "slice_index": {
                 "type": "integer",
                 "description": (
