@@ -22,7 +22,7 @@ Sessions, pins, and reviews are rewritten when the page changes them. Audit runs
 
 Each run stores the question, start and finish times, `duration_ms`, `outcome` (`success` or `failure`), the step list, tool calls, citation-check refusals, the delivered answer, and citation summaries.
 
-A tool call in the export is the cite token, tool name, file label, modality, and `web_path`. A refusal is the attempt number and the problem string. A citation summary keeps `cite`, `id`, `kind`, `web_path`, `summary`, and `agent` when those fields are present.
+A tool call in the export is the cite token, tool name, file label, modality, `web_path`, and `by`: `router`, or the specialist that made the read. A refusal is the attempt number and the problem string. A citation summary keeps `cite`, `id`, `kind`, `web_path`, `summary`, `agent`, `inputs`, `finding`, and `basis` when those fields are present. A consult step keeps the question, context, and reply.
 
 The export leaves out file bodies, evidence quotes, and the correction prompt sent back to the agent.
 
