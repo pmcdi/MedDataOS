@@ -20,8 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-import meddataos.specialists.common  # noqa: F401  (loads .env)
 from meddataos.datactrl import Case
+from meddataos.specialists.common import latest_request  # also loads .env
 
 from meddataos.specialists.imaging.read import read_slice
 
@@ -45,9 +45,26 @@ def _mark(summary: str, cite_id: str = "1") -> str:
 
 
 def cited_reply(read) -> str:
-    """Citation JSON when a series was chosen, otherwise plain text."""
+    """Citation JSON when a series was chosen, otherwise what is needed to choose.
+
+    With no confident series the reply cites nothing and names, under ``needs``,
+    the series the caller can ask for by id.
+    """
     if not read.series_path:
-        return read.summary
+        if not read.candidates:
+            return read.summary
+        return json.dumps(
+            {
+                "response": read.summary,
+                "citations": [],
+                "needs": [{
+                    "what": "which series to read, passed as resource_ids",
+                    "why": "No series matched the question with confidence.",
+                    "options": read.candidates,
+                }],
+            },
+            ensure_ascii=False,
+        )
 
     citation = {
         "id": "1",
@@ -64,21 +81,6 @@ def cited_reply(read) -> str:
     )
 
 
-def question_from(messages: list) -> str:
-    """The latest user question, skipping a citation-correction turn."""
-    users = [
-        message.get("content")
-        for message in messages
-        if isinstance(message, dict)
-        and message.get("role") == "user"
-        and isinstance(message.get("content"), str)
-    ]
-    for text in reversed(users):
-        if not text.startswith("The server refused"):
-            return text.strip()
-    return (users[-1] if users else "").strip()
-
-
 class Handler(BaseHTTPRequestHandler):
     case: Case
     patient_id: str
@@ -90,7 +92,10 @@ class Handler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
-        question = question_from(body.get("messages") or [])
+        request = latest_request(body.get("messages") or [])
+        question = request.question
+        known = {ref.id for ref in self.case.report.dicom}
+        resource_id = next((item for item in request.resource_ids if item in known), None)
         print(f"imaging  question: {question}", flush=True)
 
         if question == "Fill in the patient card.":
@@ -109,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            read = read_slice(self.case, question)
+            read = read_slice(self.case, question, resource_id=resource_id)
             content = cited_reply(read)
             print(f"imaging  series={read.series_id or '-'} chars={len(content)}", flush=True)
         except Exception as exc:

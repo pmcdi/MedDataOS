@@ -18,8 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-import meddataos.specialists.common  # noqa: F401  (loads .env)
 from meddataos.datactrl import Case
+from meddataos.specialists.common import latest_request  # also loads .env
 
 from meddataos.specialists.notes.agent import answer_question
 
@@ -94,11 +94,52 @@ def _cite_discrepancies(
                     "span_url": value.get("span_url"),
                     "derived": value.get("derived") or "native",
                 }],
-                "conflicts": conflicts,
+                "conflicts": [
+                    item for item in conflicts
+                    if any(
+                        str(v.get("note_id") or "").split("#", 1)[0] == note_id
+                        for v in item.get("values") or []
+                        if isinstance(v, dict)
+                    )
+                ],
             })
         response = response.replace(f"({label})", f"[cite:{cite_id}]")
         response = response.replace(label, f"[cite:{cite_id}]")
     return response
+
+
+def _touches(conflict: dict, rows: list) -> bool:
+    """Whether a conflict involves these evidence rows.
+
+    It does when a row cites one of the conflict's facts, or quotes a passage
+    that overlaps one of the conflict's values in the same note.
+    """
+    values = [v for v in conflict.get("values") or [] if isinstance(v, dict)]
+    fact_ids = {v.get("fact_id") for v in values if v.get("fact_id")}
+
+    for row in rows:
+        if row.get("fact_id") and row["fact_id"] in fact_ids:
+            return True
+
+        note = str(row.get("note_id") or "")
+        start, end = row.get("start"), row.get("end")
+
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+
+        for value in values:
+            lo, hi = value.get("char_start"), value.get("char_end")
+
+            if (
+                str(value.get("note_id") or "") == note
+                and isinstance(lo, int)
+                and isinstance(hi, int)
+                and lo < end
+                and start < hi
+            ):
+                return True
+
+    return False
 
 
 def cited_reply(case: Case, result) -> str:
@@ -144,34 +185,39 @@ def cited_reply(case: Case, result) -> str:
             "web_path": path,
             "summary": str(evidence.get("quote") or "")[:500],
             "evidence": by_claim.get(number, []),
-            "conflicts": conflicts,
+            # Only the discrepancies this claim's own quotes are part of. The
+            # rest stay in the reply text, not on every card.
+            "conflicts": [
+                item for item in conflicts if _touches(item, by_claim.get(number, []))
+            ],
         })
         seen.add(number)
 
     response = _cite_discrepancies(response, conflicts, files, citations, by_claim)
+    abstentions = [item for item in (result.abstentions or []) if isinstance(item, str)]
 
-    if not citations:
+    if not citations and not abstentions:
         return response
-    return json.dumps({"response": response, "citations": citations}, ensure_ascii=False)
 
+    reply: dict = {"response": response, "citations": citations}
 
-def question_from(messages: list) -> str:
-    """The latest user question, skipping a citation-correction turn.
+    if abstentions:
+        reply["abstentions"] = abstentions
 
-    The page sends the whole chat. A correction from the server is appended
-    after the question, so the question is the last user turn that is not one.
-    """
-    users = [
-        message.get("content")
-        for message in messages
-        if isinstance(message, dict)
-        and message.get("role") == "user"
-        and isinstance(message.get("content"), str)
+    # Keyed facts of the claims that became citations, for comparison with
+    # what the tables and the images say.
+    cited = {item["id"] for item in citations}
+    facts = [
+        {**{key: value for key, value in fact.items() if key != "n" and value is not None},
+         "cite": str(fact["n"])}
+        for fact in getattr(result, "facts", None) or []
+        if str(fact.get("n")) in cited
     ]
-    for text in reversed(users):
-        if not text.startswith("The server refused"):
-            return text.strip()
-    return (users[-1] if users else "").strip()
+
+    if facts:
+        reply["facts"] = facts
+
+    return json.dumps(reply, ensure_ascii=False)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -185,7 +231,8 @@ class Handler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
-        question = question_from(body.get("messages") or [])
+        request = latest_request(body.get("messages") or [])
+        question = request.question
         print(f"notes  question: {question}", flush=True)
 
         if question == "Fill in the patient card.":
@@ -204,7 +251,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = answer_question(self.patient_id, question, case=self.case)
+            result = answer_question(
+                self.patient_id, question, case=self.case, context=request.context
+            )
             content = cited_reply(self.case, result)
             print(
                 f"notes  mode={result.mode} facts={result.stats.get('facts')} "

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from meddataos.datactrl.errors import DataCtrlError
 
@@ -46,6 +46,8 @@ class SliceRead:
     series_id: str = ""
     series_path: str = ""
     preview: dict | None = None
+    # Ranked series ids, set when no series was chosen with confidence.
+    candidates: list[str] = field(default_factory=list)
 
 
 def read_slice(
@@ -65,7 +67,13 @@ def read_slice(
     ranked = rank_series(refs, query, limit=5)
     chosen = _resolve_series(refs, ranked, resource_id)
     if chosen is None:
-        return SliceRead(summary=_format_candidates(ranked), file="dicom_select.txt")
+        return SliceRead(
+            summary=_format_candidates(ranked),
+            file="dicom_select.txt",
+            candidates=[
+                str(item["id"]) for item in ranked.get("candidates") or [] if item.get("id")
+            ],
+        )
 
     series_id = chosen["id"]
     ref = next(item for item in refs if item.id == series_id)
@@ -232,7 +240,7 @@ def _format_candidates(ranked: dict) -> str:
     intent = ranked.get("intent") or {}
     lines = [
         "No confident DICOM series match. Ranked candidates "
-        "(name one by its resource id to read it):",
+        "(ask again with one of these ids in resource_ids to read it):",
         f"intent={intent}",
     ]
     for item in ranked.get("candidates") or []:

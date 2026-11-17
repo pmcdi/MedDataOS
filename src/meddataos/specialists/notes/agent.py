@@ -143,6 +143,8 @@ class NotesResult:
     abstentions: list[str] = field(default_factory=list)
     mode: str = "direct"
     stats: dict[str, Any] = field(default_factory=dict)
+    # Keyed ledger facts behind the verified claims, each with its claim number.
+    facts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _empty_ledger(patient_id: str, case) -> Ledger:
@@ -446,8 +448,59 @@ def _ensure_vital_status(verified: VerifiedAnswer, ledger: Ledger) -> None:
     ))
 
 
-def answer_question(patient_id: str, query: str, *, case=None, ledger: Ledger | None = None) -> NotesResult:
-    """Answer a clinician's question from one patient's notes."""
+_CONTEXT_BLOCK = (
+    "\n\nContext from other specialists (it is not in this patient's notes, so do "
+    "not cite it or repeat it as a finding; use it only to understand what is "
+    "being asked):\n{context}"
+)
+
+
+def _fact_rows(
+    verified: VerifiedAnswer, ledger: Ledger, extra_facts: dict[str, Fact] | None
+) -> list[dict[str, Any]]:
+    """Ledger facts behind each verified claim: the cited fact, or one in the quoted span."""
+    by_id = {fact.fact_id: fact for fact in ledger.facts}
+    by_id.update(extra_facts or {})
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+
+    for n, claim in enumerate(verified.claims, start=1):
+        for ev in claim.evidence:
+            found = [by_id[ev.fact_id]] if ev.fact_id in by_id else [
+                fact for fact in by_id.values()
+                if fact.note_id == ev.doc_id
+                and fact.char_start < ev.end and ev.start < fact.char_end
+            ]
+            for fact in found:
+                if (n, fact.fact_id) in seen:
+                    continue
+                seen.add((n, fact.fact_id))
+                rows.append({
+                    "n": n,
+                    "key": fact.attribute,
+                    "value": fact.value,
+                    "unit": fact.unit,
+                    "date": fact.event_date or fact.note_date,
+                    "source_type": fact.source_type,
+                    "assertion": fact.assertion,
+                    "label": fact.note_label,
+                })
+    return rows
+
+
+def answer_question(
+    patient_id: str,
+    query: str,
+    *,
+    case=None,
+    ledger: Ledger | None = None,
+    context: str = "",
+) -> NotesResult:
+    """Answer a clinician's question from one patient's notes.
+
+    ``context`` is what other specialists found. It frames the question and is
+    never cited: every claim still has to be verified against the notes.
+    """
     from meddataos.specialists.gemini import NOTES_REASON_MODEL
     from meddataos.specialists.common import get_case
 
@@ -468,9 +521,10 @@ def answer_question(patient_id: str, query: str, *, case=None, ledger: Ledger | 
     stats.update({"total_chars": total, "facts": len(ledger.facts), "conflicts": len(ledger.conflicts)})
 
     session = None
+    asked = query + (_CONTEXT_BLOCK.format(context=context.strip()) if context.strip() else "")
     if mode == "direct":
         prompt = _DIRECT_PROMPT.format(
-            query=query,
+            query=asked,
             notes=_note_blocks(ledger, texts),
             ledger=ledger.digest() or "(no compiled facts)",
             timeline=ledger.timeline_digest() or "(empty)",
@@ -479,7 +533,7 @@ def answer_question(patient_id: str, query: str, *, case=None, ledger: Ledger | 
         )
         payload = llm.generate_json(prompt, model=NOTES_REASON_MODEL)
     else:
-        payload, session = _navigate(query, case, ledger, texts, NOTES_REASON_MODEL)
+        payload, session = _navigate(asked, case, ledger, texts, NOTES_REASON_MODEL)
         stats["tool_calls"] = session.log
     if not isinstance(payload, dict):
         payload = {"claims": payload if isinstance(payload, list) else []}
@@ -497,4 +551,5 @@ def answer_question(patient_id: str, query: str, *, case=None, ledger: Ledger | 
         abstentions=verified.abstentions,
         mode=mode,
         stats=stats,
+        facts=_fact_rows(verified, ledger, session.extra_facts if session else None),
     )
