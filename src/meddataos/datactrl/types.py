@@ -238,6 +238,7 @@ def _inventory_dicom_fields(ref: ResourceRef) -> dict[str, Any]:
         "SeriesDescription",
         "ProtocolName",
         "StudyDescription",
+        "StudyDate",
         "BodyPartExamined",
     ):
         value = meta.get(key)

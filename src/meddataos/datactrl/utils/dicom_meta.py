@@ -29,6 +29,7 @@ _PUBLIC_META_KEYS = (
     "SeriesDescription",
     "ProtocolName",
     "StudyDescription",
+    "StudyDate",
     "BodyPartExamined",
     "ImageType",
     "series_kind",

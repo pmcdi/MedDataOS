@@ -22,6 +22,9 @@ let patientReviews = {};  // patient_id -> {"agent|web_path": {"0": true, ...}}
 let modalCitation = null; // citation currently shown in modal
 let currentModalPin = null; // full pin object for modal (or null if not pinned)
 let lastUserQuery = '';     // last query text for pin provenance
+let patientTimeline = null; // {lanes, range} for the open case
+let timelineCited = new Set(); // dates the latest answer's citations rest on
+let lastAnswerCitations = [];  // citations of the answer rendered last
 
 // DOM elements
 const chatContainer = document.getElementById('chat-container');
@@ -713,6 +716,7 @@ async function switchConversation(patientId, sid) {
     if (changingPatient) {
         await Promise.all([fetchPins(patientId), fetchReviews(patientId)]);
     }
+    if (changingPatient || !patientTimeline) loadTimeline(patientId);
     renderInsightsPanel();
 
     // Clear chat and load history
@@ -736,6 +740,56 @@ async function switchConversation(patientId, sid) {
     if (waiting && live) renderLiveSteps(live.steps || [], live.activity, live.elapsed_ms);
     highlightPinnedText();
     updateCitationBadgeStates();
+    markTimeline(lastAnswerCitations);
+}
+
+// ─── Patient timeline ───────────────────────────────────────
+const timelineStrip = document.getElementById('timeline-strip');
+
+async function loadTimeline(patientId) {
+    patientTimeline = null;
+    try {
+        const res = await fetch(`/api/patients/${encodeURIComponent(patientId)}/timeline`);
+        if (res.ok) patientTimeline = await res.json();
+    } catch (e) {
+        console.error('Failed to load timeline:', e);
+    }
+    renderTimeline();
+}
+
+function renderTimeline() {
+    if (!timelineStrip) return;
+    const html = MedEvidence.timelineHTML(patientTimeline, timelineCited);
+    timelineStrip.hidden = !html;
+    if (!html) return;
+    const open = timelineStrip.dataset.closed !== 'true';
+    timelineStrip.innerHTML = `<details class="tl"${open ? ' open' : ''}>`
+        + `<summary><span class="tl-title">Timeline</span><span class="tl-range">${escapeHtml(patientTimeline.range[0])} to ${escapeHtml(patientTimeline.range[1])}</span>`
+        + `<span class="tl-legend">${timelineCited.size ? '<span class="tl-mark tl-mark-cited"></span> cited in the latest answer' : ''}</span></summary>${html}</details>`;
+    timelineStrip.querySelector('details').addEventListener('toggle', (e) => {
+        timelineStrip.dataset.closed = e.target.open ? 'false' : 'true';
+    });
+}
+
+// Mark the dates the latest answer's citations rest on.
+function markTimeline(citations) {
+    timelineCited = MedEvidence.citedDates(citations || []);
+    renderTimeline();
+}
+
+// A mark opens its file: a note as text, a table at that row.
+if (timelineStrip) {
+    timelineStrip.addEventListener('click', (e) => {
+        const mark = e.target.closest('.tl-mark');
+        if (!mark || !mark.dataset.path) return;
+        const path = mark.dataset.path;
+        const file = decodeURIComponent(path.split('/').pop());
+        const type = getCitationType(file);
+        if (type !== 'csv' && type !== 'text') return;
+        const citation = { id: 'timeline', kind: 'file', file, web_path: path, summary: mark.title };
+        if (type === 'csv' && mark.dataset.row != null) citation.cells = [{ row: Number(mark.dataset.row) }];
+        openCitationModal(citation);
+    });
 }
 
 // ─── Sidebar: Create New Conversation ───────────────────────
@@ -848,6 +902,7 @@ function handleWebSocketMessage(data) {
         setProcessing(false);
         addChatMessage('assistant', data.message, data.timestamp || new Date().toISOString(), steps, data.duration_ms);
         updateCitationBadgeStates();
+        markTimeline(lastAnswerCitations);
         // Refresh sidebar to update conversation preview
         refreshSidebarConversations();
         return;
@@ -1084,6 +1139,12 @@ const provenanceSteps = {
         { label: 'Timeline and conflicts', desc: 'Dates ordered; disagreements between notes kept' },
         { label: 'Verified quotes', desc: 'Each claim checked against a span in the source note' },
     ],
+    'structured': [
+        { label: 'Catalog', desc: 'Each table typed: columns, dates, the tests it holds, and its layout' },
+        { label: 'Planned reads', desc: 'A model names the reads: rows, one test over time, or a score' },
+        { label: 'Computed by code', desc: 'First, last, lowest, highest, change, and scores come from the table tool, not the model' },
+        { label: 'Checked twice', desc: 'A claim whose numbers are not in its read is dropped; the server checks each cited cell and value again' },
+    ],
     'imaging': [
         { label: 'Series selection', desc: 'The case series ranked against the question; no confident match means no read' },
         { label: 'Slice render', desc: 'One bounded preview slice rendered from the DICOM series, with contours when asked' },
@@ -1136,6 +1197,18 @@ const agentInfo = {
         paper: 'https://arxiv.org/abs/2512.24601',
         license: 'N/A',
         limitations: 'Extraction can miss facts. Inferred dates are approximate. Advisory only.',
+    },
+    'structured': {
+        model: 'Tabular specialist (model plans, code computes)',
+        modelUrl: null,
+        purpose: 'Answers from the case\'s tables: values on a date, trends, and clinical scores',
+        input: 'Tables in the case folder (CSV, TSV, JSON lines)',
+        output: 'Claims tied to table cells, and values computed by the table tool',
+        method: 'A model chooses which reads to make. Code computes every number and drops any claim whose numbers are not in its read.',
+        accuracy: 'Cited cells and computed values are checked by the server against the file',
+        paper: null,
+        license: 'Research prototype',
+        limitations: 'Only units with a listed conversion are brought to one unit. Scores use the formulas shown and need every input. Advisory only.',
     },
     'imaging': {
         model: 'Gemini vision + datactrl preview',
@@ -1223,6 +1296,25 @@ const agentInfo = {
     },
 };
 
+// The card for a file the router read itself, with no specialist in between.
+function routerInfo(citation) {
+    const basis = MedEvidence.basisInfo(citation);
+    return {
+        model: 'Router (read directly, no specialist)',
+        modelUrl: null,
+        purpose: 'The router opened this file itself with the case tools',
+        input: citation.file || 'A case file',
+        output: 'A claim cited to that read',
+        method: citation.command
+            ? `${citation.command.tool} ${Object.entries(citation.command.arguments || {}).filter(([key]) => key !== 'resource_id').map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`).join(' ')}`.trim()
+            : 'describe or fetch on the open case',
+        accuracy: basis ? basis.text : 'Not checked by a specialist',
+        paper: null,
+        license: 'N/A',
+        limitations: 'No specialist verified this read. A quote is located in the note but not checked for whether it supports the claim.',
+    };
+}
+
 // Extract data date for a citation from active patient's data_dates
 function getCitationDate(citation) {
     if (!activePatientId || !citation.web_path) return '';
@@ -1259,12 +1351,20 @@ function renderWithCitations(html, citations) {
     return html.replace(/\[cite:([^\]]+)\]/g, (match, id) => {
         const citation = citationMap[id];
         if (!citation) return match;
-        const data = encodeURIComponent(JSON.stringify(citation));
-        const label = citationLabel(agentBadgeLabels, citation.agent, citation);
-        const dateStr = getCitationDate(citation);
-        const token = String(citation.cite || citation.id || id);
-        return `<span class="citation-group"><sup class="citation" data-citation="${data}">${escapeHtml(label)}<span class="citation-token">${escapeHtml(token)}</span></sup>${dateStr ? `<span class="citation-date">${dateStr}</span>` : ''}</span>`;
+        return citationBadge(citation, id);
     });
+}
+
+// One hoverable badge. Its class says what the citation rests on and whether
+// that was checked, so an unverified read does not look like a verified one.
+function citationBadge(citation, id) {
+    const data = encodeURIComponent(JSON.stringify(citation));
+    const label = citationLabel(agentBadgeLabels, citation.agent, citation);
+    const dateStr = getCitationDate(citation);
+    const token = String(citation.cite || citation.id || id || '');
+    const basis = MedEvidence.basisInfo(citation);
+    const title = basis ? ` title="${escapeHtml(basis.text)}"` : '';
+    return `<span class="citation-group"><sup class="citation${MedEvidence.basisClass(citation)}" data-citation="${data}"${title}>${escapeHtml(label)}<span class="citation-token">${escapeHtml(token)}</span></sup>${dateStr ? `<span class="citation-date">${dateStr}</span>` : ''}</span>`;
 }
 
 // Build a minimal citation object for a given agent + active patient (for KB hover cards)
@@ -1491,6 +1591,13 @@ async function showCitationPopup(anchor, citation) {
         contentHTML = `<video class="card-video" src="${citation.web_path}" controls></video>`;
     } else if (type === 'audio') {
         contentHTML = `<div class="card-audio-wrap"><audio class="card-audio" src="${citation.web_path}" controls></audio></div>`;
+    } else if (MedEvidence.seriesOf(citation)) {
+        // The series the server recorded for this call, with the cited points marked.
+        contentHTML = MedEvidence.seriesBlock(citation, [], true);
+        contentClass = 'card-content card-content-evidence';
+    } else if (MedEvidence.scoreOf(citation)) {
+        contentHTML = MedEvidence.scoreBlock(citation, true);
+        contentClass = 'card-content card-content-evidence';
     } else if (hasNotesEvidence(citation)) {
         contentHTML = renderEvidenceCompact(citation.evidence);
     } else if (type === 'text' || type === 'csv') {
@@ -1524,16 +1631,19 @@ async function showCitationPopup(anchor, citation) {
     const dicomHTML = type === 'dicom' && dicomPreview
         ? `<div class="dicom-caption">${escapeHtml(dicomCaption(dicomPreview))}</div>`
         : '';
-    const derivedHTML = renderDerivedBlock(citation, true);
+    // A score shows its own result and inputs, so the derived block would repeat them.
+    const derivedHTML = MedEvidence.scoreOf(citation) ? '' : renderDerivedBlock(citation, true);
 
     citationPopup.innerHTML = `
         <div class="card-header">
             <span class="card-agent">${escapeHtml(agentLabel)}</span>
+            ${MedEvidence.basisChip(citation)}
             ${pinBtnHTML}
         </div>
         ${contentHTML ? `<div class="${contentClass}" id="card-content-inner">${contentHTML}</div>` : '<div id="card-content-inner"></div>'}
         ${dicomHTML}
         ${derivedHTML}
+        ${MedEvidence.cellsLine(citation)}
         <div class="card-summary">${summaryHTML}</div>
         ${renderNotesConflicts(notesConflictsToShow(citation), true)}
         ${conflictHTML}
@@ -1542,8 +1652,18 @@ async function showCitationPopup(anchor, citation) {
     citationPopup.style.display = 'block';
     positionPopup(anchor);
 
+    // A table is parsed by the server and shown around its cited rows.
+    if (type === 'csv' && !MedEvidence.seriesOf(citation) && !MedEvidence.scoreOf(citation)) {
+        const inner = document.getElementById('card-content-inner');
+        if (inner) {
+            await MedEvidence.loadTable(citation, inner, 8);
+            if (citationPopup._citation === citation) positionPopup(anchor);
+        }
+        return;
+    }
+
     // Fetch and render text-based content
-    if ((type === 'csv' || type === 'text') && !hasNotesEvidence(citation)) {
+    if (type === 'text' && !hasNotesEvidence(citation)) {
         try {
             const response = await fetch(citation.web_path + '?t=' + Date.now());
             const text = await response.text();
@@ -1551,8 +1671,6 @@ async function showCitationPopup(anchor, citation) {
             if (inner) {
                 inner.innerHTML = !response.ok
                     ? `<div class="card-text card-error">Could not load this file.</div>`
-                    : type === 'csv'
-                    ? csvToHTML(text)
                     : `<div class="card-text">${plainTextToHTML(text.slice(0, 600))}${text.length > 600 ? '<p>…</p>' : ''}</div>`;
                 positionPopup(anchor);
             }
@@ -1663,6 +1781,7 @@ async function resyncSession() {
 function renderAssistantContent(rawContent) {
     let responseText = rawContent;
     let citations = [];
+    let discrepancies = [];
     const cut = rawContent.search(/\n\s*\{/);
     const candidates = [rawContent];
     if (cut !== -1) candidates.push(rawContent.slice(cut).trim());
@@ -1673,6 +1792,7 @@ function renderAssistantContent(rawContent) {
             if (parsed.response && parsed.citations) {
                 responseText = parsed.response;
                 citations = parsed.citations;
+                discrepancies = Array.isArray(parsed.discrepancies) ? parsed.discrepancies : [];
                 break;
             }
             if (!parsed.citations) {
@@ -1690,7 +1810,11 @@ function renderAssistantContent(rawContent) {
     const rawHtml = marked.parse(responseText);
     const safeHtml = DOMPurify.sanitize(rawHtml);
     const withWarnings = safeHtml.replace(/⚠️\s*(<strong>.*?<\/strong>)/g, '<span class="warning-group">⚠️\u00A0$1</span>');
-    return citations.length > 0 ? renderWithCitations(withWarnings, citations) : withWarnings;
+    lastAnswerCitations = citations;
+    if (!citations.length) return withWarnings;
+    // Where sources disagree, shown under the answer with a badge for each value.
+    return renderWithCitations(withWarnings, citations)
+        + MedEvidence.discrepanciesHTML(discrepancies, citations, citationBadge);
 }
 
 function stepStatus(step) {
@@ -1800,9 +1924,22 @@ function stepRows(steps) {
         const kind = stepKind(step);
         const showKind = kind !== previous;
         previous = kind;
-        return stepRow(step, showKind);
+        const detail = MedEvidence.consultDetail(step);
+        const open = openConsultDetails.has(String(step.step_id)) ? ' open' : '';
+        return stepRow(step, showKind) + (detail
+            ? `<li class="step-detail" data-detail-for="${escapeHtml(String(step.step_id || ''))}"><details${open}><summary>Asked and replied</summary>${detail}</details></li>`
+            : '');
     }).join('');
 }
+
+// Consult details the reader opened, kept open while the live list repaints.
+const openConsultDetails = new Set();
+document.addEventListener('toggle', (e) => {
+    const row = e.target.closest ? e.target.closest('.step-detail') : null;
+    if (!row) return;
+    if (e.target.open) openConsultDetails.add(row.dataset.detailFor);
+    else openConsultDetails.delete(row.dataset.detailFor);
+}, true);
 
 function renderStepTrace(steps, durationMs) {
     const label = escapeHtml(workedLabel(steps, durationMs));
@@ -2244,7 +2381,7 @@ async function openCitationModal(citation, pin = null, focusSpanUrl = null) {
     const type = dicomRecord(citation) ? 'dicom' : getCitationType(citation.file);
     const agentLabel = citationLabel(agentCardLabels, citation.agent, citation);
 
-    modalAgent.textContent = agentLabel;
+    modalAgent.innerHTML = escapeHtml(agentLabel) + MedEvidence.basisChip(citation);
 
     if (activePatientId) {
         modalPin.style.display = '';
@@ -2254,7 +2391,11 @@ async function openCitationModal(citation, pin = null, focusSpanUrl = null) {
     }
 
     // ── Agent info panel ──────────────────────────────────
-    const info = agentInfo[citation.agent];
+    // A file the router read itself was not checked by a specialist, so it does
+    // not get that specialist's card.
+    const info = citation.basis && citation.basis.by === 'router'
+        ? routerInfo(citation)
+        : agentInfo[citation.agent];
     if (info) {
         const paperHTML = info.paper
             ? `<a href="${escapeHtml(info.paper)}" target="_blank" rel="noopener" class="agent-model-link">${info.paper.includes('arxiv') ? 'arXiv' : 'Paper'} &#x2197;</a>`
@@ -2328,7 +2469,20 @@ async function openCitationModal(citation, pin = null, focusSpanUrl = null) {
 
     // ── Build body content ───────────────────────────────────
     let contentHTML = '';
-    if (citation.kind === 'derived') {
+    const onTable = type === 'csv' && MedEvidence.isTable(citation);
+    if (onTable) {
+        // What the server recorded for the call: the score's inputs or the
+        // series, then the table itself with the cited cells marked.
+        const markers = MedEvidence.chartMarkers(patientTimeline);
+        contentHTML = '<div class="evidence-pane">'
+            + (MedEvidence.scoreOf(citation)
+                ? MedEvidence.scoreBlock(citation, false)
+                : (citation.kind === 'derived' ? renderDerivedBlock(citation, false) : ''))
+            + MedEvidence.seriesBlock(citation, markers, false)
+            + MedEvidence.cellsLine(citation)
+            + '<div class="evidence-table-host" id="evidence-table-host"><div class="modal-loading">Loading\u2026</div></div>'
+            + '</div>';
+    } else if (citation.kind === 'derived') {
         contentHTML = renderDerivedBlock(citation, false);
     } else if (type === 'dicom') {
         const figures = dicomPreviews(citation).map((preview, index, all) => {
@@ -2395,7 +2549,10 @@ async function openCitationModal(citation, pin = null, focusSpanUrl = null) {
     citationModal.classList.add('open');
 
     // Fetch text-based content
-    if (citation.kind === 'derived') {
+    if (onTable) {
+        const host = document.getElementById('evidence-table-host');
+        if (host) MedEvidence.loadTable(MedEvidence.withScoreRows(citation), host);
+    } else if (citation.kind === 'derived') {
         // Method/result already rendered in the body; no file load.
     } else if (hasNotesEvidence(citation)) {
         renderNotesModalBody(citation, focusSpanUrl);

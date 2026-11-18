@@ -230,8 +230,41 @@ class NoteCitation(BaseModel):
     agent: Literal["clinical_notes"] | None = None
 
 
+class Cell(BaseModel):
+    """One table cell a claim rests on."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    row: int = Field(
+        description=(
+            "The row's position in the file: an entry of row_numbers on a rows "
+            "fetch, or row on a series point."
+        ),
+        examples=[12],
+    )
+    column: str | None = Field(
+        default=None,
+        description="The column. May be left out on a series fetch.",
+        examples=["value"],
+    )
+    value: str | float | int | None = Field(
+        default=None,
+        description=(
+            "The value read from that cell. The server refuses a value the "
+            "call did not return, and fills it in when it is left out."
+        ),
+        examples=["13.1"],
+    )
+
+
 class TableCitation(BaseModel):
-    """A table read with describe or fetch."""
+    """A table read with describe or fetch.
+
+    Name the cells the claim rests on. A number that is not in a cell, such as a
+    change, a lowest value, or a score, comes from a series or score fetch and is
+    cited as kind derived.
+
+    """
 
     model_config = ConfigDict(
         extra="forbid",
@@ -244,6 +277,10 @@ class TableCitation(BaseModel):
                         "Lab table. Hemoglobin was 13.1 and WBC 6.2 on the listed draw."
                     ),
                     "fields": ["test", "value"],
+                    "cells": [
+                        {"row": 0, "column": "value", "value": "13.1"},
+                        {"row": 1, "column": "value", "value": "6.2"},
+                    ],
                 },
             ]
         },
@@ -256,6 +293,10 @@ class TableCitation(BaseModel):
         default=None,
         description="Columns that support the claim.",
         examples=[["test", "value"]],
+    )
+    cells: list[Cell] | None = Field(
+        default=None,
+        description="The cells that support the claim. The server checks each one.",
     )
 
 
@@ -335,7 +376,8 @@ class DerivedCitation(BaseModel):
     produced from that call (for example voxel volume from a volume fetch, or a
     model score). Cite the call the marker points at. inputs names every call the
     value used, including that one. method is plain prose a reviewer can read
-    on the card.
+    on the card. On a table, the value has to be one the series or score fetch
+    returned: the server refuses a number worked out from table cells by hand.
 
     """
 
@@ -395,6 +437,13 @@ class DerivedCitation(BaseModel):
         description=(
             "Every describe or fetch this value used. Each item names that call's "
             "cite token and what was taken from it."
+        ),
+    )
+    cells: list[Cell] | None = Field(
+        default=None,
+        description=(
+            "On a table: the cells of the cited call the value was worked out "
+            "from. The server checks each one."
         ),
     )
 
@@ -467,10 +516,17 @@ class CitedAnswer(BaseModel):
             "The answer for the user. Put [cite:token] right after the words that "
             "call supports. "
             "Markers may not sit side by side, be grouped at the end, or be a sentence"
-            "on their own."
+            "on their own. "
+            "A specialist's finding is cited by its id, such as [cite:notes.1]."
         ),
     )
-    citations: list[Citation] = Field(min_length=1)
+    citations: list[Citation] = Field(
+        description=(
+            "One citation per describe or fetch you cite. A specialist's finding "
+            "needs no entry here: the server attaches its checked citation. The "
+            "list is empty when every marker names a finding."
+        ),
+    )
 
 
 EXAMPLE: dict = _example(CitedAnswer)

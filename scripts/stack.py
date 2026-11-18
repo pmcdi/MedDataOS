@@ -3,9 +3,12 @@
     pixi run stack data/TCGA-DD-A4NF
     pixi run stack data/RADCURE-0006 --only notes
 
-The router is examples/agent.py. The specialists come from configs/agents.toml, and
-their ports are read from the url in that file. Output from each process is
-prefixed with its name. Ctrl-C stops everything.
+The router is the orchestrator (meddataos.orchestrator.serve), which plans,
+consults, reconciles and gap-checks in code. `--router example` runs
+examples/agent.py instead, which passes each request straight to the model.
+The specialists come from configs/agents.toml, and their ports are read from
+the url in that file. Output from each process is prefixed with its name.
+Ctrl-C stops everything.
 """
 
 from __future__ import annotations
@@ -33,6 +36,11 @@ ROUTER_PORT = 8001
 SPECIALIST_MODULES = {
     "notes": "meddataos.specialists.notes.serve",
     "imaging": "meddataos.specialists.imaging.serve",
+    "tabular": "meddataos.specialists.tabular.serve",
+}
+ROUTERS = {
+    "orchestrator": ["-m", "meddataos.orchestrator.serve"],
+    "example": ["examples/agent.py"],
 }
 
 
@@ -98,6 +106,12 @@ def main() -> int:
         "--only",
         help="Comma-separated specialists to start. Default is every one in configs/agents.toml.",
     )
+    parser.add_argument(
+        "--router",
+        choices=sorted(ROUTERS),
+        default="orchestrator",
+        help="The agent at --agent-url. Default is the orchestrator.",
+    )
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
@@ -135,7 +149,8 @@ def main() -> int:
     chosen.write_text(
         "".join(
             f"[{n}]\nurl = {json.dumps(registry[n]['url'])}\n"
-            f"description = {json.dumps(registry[n]['description'])}\n\n"
+            f"description = {json.dumps(registry[n]['description'])}\n"
+            f"modalities = {json.dumps(registry[n].get('modalities', []))}\n\n"
             for n in wanted
         )
     )
@@ -151,7 +166,9 @@ def main() -> int:
 
     try:
         procs["router"] = _spawn(
-            "router", [sys.executable, "examples/agent.py", "--port", str(ROUTER_PORT)], env
+            "router",
+            [sys.executable, *ROUTERS[args.router], "--port", str(ROUTER_PORT)],
+            env,
         )
         for name in wanted:
             procs[name] = _spawn(

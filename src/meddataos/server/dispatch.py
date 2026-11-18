@@ -20,10 +20,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from meddataos.server import answer
-from meddataos.server.case import Answer, Contract, Profile, case, path_key
+from meddataos.server import answer, findings, store
+from meddataos.server.case import Answer, Contract, Profile, case
 from meddataos.server.registry import Specialist
-from meddataos.server import store
 from meddataos.server.state import log, short_session, state
 
 _tasks: set[asyncio.Task] = set()
@@ -39,6 +38,7 @@ _TOOL_LABELS = {
     "discover": "Discovering the case",
     "describe": "Describing",
     "fetch": "Reading",
+    "notes_search": "Searching the notes",
     "links": "Listing links",
     "assert_link": "Checking a link",
     "dicom_tree": "Reading the DICOM tree",
@@ -273,6 +273,36 @@ class AgentClient:
         return f"{self.url} answered {exc.code}" + (f": {detail}" if detail else "")
 
 
+# How often one question may consult. A repeat of the same call is answered from
+# the first one and does not count.
+MAX_CONSULTS_PER_SPECIALIST = 3
+MAX_CONSULTS = 8
+
+# What a consult step keeps of the question and the reply, for the trace.
+MAX_STEP_TEXT = 700
+
+# Tools that open a file's contents. The router leaves these to the specialist
+# that owns the file's modality.
+_OWNED_TOOLS = ("describe", "fetch", "notes_search")
+_MODALITY_WORDS = {"note": "Notes", "structured": "Tables", "dicom": "Images"}
+
+
+def _consults(session_id: str) -> dict:
+    """The consult book for the open question: calls made, counts, and failures."""
+    return state.consults.setdefault(
+        session_id, {"tasks": {}, "count": {}, "failed": set()}
+    )
+
+
+def calls_by(session_id: str, by: str) -> dict[str, dict]:
+    """The reads one party made for this question, by cite token."""
+    return {
+        token: call
+        for token, call in state.calls.get(session_id, {}).items()
+        if call.get("by", "router") == by
+    }
+
+
 class Conversation:
     """Messages exchanged with the agent for one piece of work, including tool calls."""
 
@@ -288,8 +318,12 @@ class Conversation:
         max_steps: int | None = None,
         answer_format: Callable[[], dict | None] | None = None,
         activity: str = "Thinking",
+        by: str = "router",
     ) -> None:
-        """The messages so far, plus how tool calls and the answer format work."""
+        """The messages so far, plus how tool calls and the answer format work.
+
+        ``by`` names who this conversation is with, and so who made its reads.
+        """
         self.messages = messages
         self.session_id = session_id
         self.client = client or AgentClient.from_env()
@@ -298,6 +332,7 @@ class Conversation:
         self.max_steps = self.MAX_STEPS if max_steps is None else max_steps
         self.answer_format = answer_format
         self.activity = activity
+        self.by = by
 
     async def reply(self) -> str:
         """Call the agent until it stops asking for tools, then return its text.
@@ -313,16 +348,42 @@ class Conversation:
             if not calls:
                 return message.get("content") or ""
 
-            for call in calls:
+            results = await self._run_calls(calls)
+
+            for call, result in zip(calls, results, strict=True):
                 self.messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.get("id", ""),
-                        "content": json.dumps(await self._run_call(call)),
+                        "content": json.dumps(result),
                     }
                 )
 
         raise AgentError(f"no answer after {self.max_steps} steps")
+
+    async def _run_calls(self, calls: list[dict]) -> list[dict]:
+        """Run one turn's tool calls and return their results in the same order.
+
+        Consults sent in one turn run at the same time: each waits on its own
+        specialist. The other tools are quick and run one after another.
+        """
+        consults = {
+            index: asyncio.ensure_future(self._run_call(call))
+            for index, call in enumerate(calls)
+            if str((call.get("function") or {}).get("name", "")).startswith("consult_")
+        }
+        results: list[dict] = []
+
+        for index, call in enumerate(calls):
+            if index in consults:
+                results.append({})
+            else:
+                results.append(await self._run_call(call))
+
+        for index, task in consults.items():
+            results[index] = await task
+
+        return results
 
     async def _next(self) -> dict:
         response_format = self.answer_format() if self.answer_format else None
@@ -372,6 +433,25 @@ class Conversation:
         if name.startswith("consult_"):
             return await self._consult(name, arguments)
 
+        owner = self._owner(name, arguments)
+
+        if owner:
+            specialist, modality = owner
+            log(
+                "agent",
+                f"session={short_session(self.session_id)} {name} left to "
+                f"consult_{specialist}",
+            )
+            return {
+                "status": "error",
+                "name": name,
+                "message": (
+                    f"{_MODALITY_WORDS.get(modality, 'Those files')} are read by "
+                    f"consult_{specialist}. Ask that specialist and cite the "
+                    "findings it returns by their id."
+                ),
+            }
+
         step_id = uuid4().hex[:12]
         await record_step(self.session_id, {
             "step_id": step_id,
@@ -380,9 +460,34 @@ class Conversation:
             "label": _tool_label(name, arguments),
             "name": name,
         })
-        result = await asyncio.to_thread(case.run, name, arguments, self.session_id)
+        result = await asyncio.to_thread(
+            case.run, name, arguments, self.session_id, self.by
+        )
         await self._finish_tool(step_id, name, arguments, result)
         return result
+
+    def _owner(self, name: str, arguments: dict) -> tuple[str, str] | None:
+        """The specialist that reads this file for the router, and its modality.
+
+        Only the router is held to this. A specialist that failed on this question
+        no longer owns its files, so the router can still answer from them.
+        """
+        if not self.consult or name not in _OWNED_TOOLS:
+            return None
+
+        if name == "notes_search":
+            modality = "note"
+        else:
+            ref = case._file_by_id(arguments.get("resource_id"))
+            modality = str(ref.get("modality") or "") if ref else ""
+
+        failed = _consults(self.session_id)["failed"]
+
+        for specialist in state.specialists.values():
+            if modality in specialist.modalities and specialist.name not in failed:
+                return specialist.name, modality
+
+        return None
 
     async def _tool_step(self, name: str, arguments: dict, result: dict) -> None:
         """Record a tool call that failed before it ran."""
@@ -426,7 +531,11 @@ class Conversation:
         await record_step(self.session_id, step)
 
     async def _consult(self, name: str, arguments: dict) -> dict:
-        """Call one registered specialist. A second call returns the first result."""
+        """Ask one registered specialist.
+
+        The same call made twice gets the first answer. A different question, new
+        context, or other resources is a new consult, up to the budget.
+        """
         if not self.consult:
             return {
                 "status": "error",
@@ -453,34 +562,109 @@ class Conversation:
                 "message": "question must be a non-empty string",
             }
 
-        cache = state.consulted.setdefault(self.session_id, {})
+        raw_context = arguments.get("context")
+        context = raw_context.strip() if isinstance(raw_context, str) else ""
+        raw_ids = arguments.get("resource_ids")
+        resource_ids = [
+            item.strip()
+            for item in (raw_ids if isinstance(raw_ids, list) else [])
+            if isinstance(item, str) and item.strip()
+        ]
+        book = _consults(self.session_id)
+        key = (
+            specialist_name,
+            " ".join(question.lower().split()),
+            " ".join(context.lower().split()),
+            tuple(resource_ids),
+        )
+        asked = book["tasks"].get(key)
 
-        if specialist_name in cache:
+        if asked is not None:
             log(
                 "agent",
                 f"session={short_session(self.session_id)} "
-                f"consult {specialist_name} already answered",
+                f"consult {specialist_name} already asked that",
             )
-            return cache[specialist_name]
+            earlier: dict = await asked
+            return earlier
 
+        used = book["count"].get(specialist_name, 0)
+
+        if used >= MAX_CONSULTS_PER_SPECIALIST or len(book["tasks"]) >= MAX_CONSULTS:
+            return {
+                "status": "error",
+                "name": name,
+                "message": (
+                    f"The consult budget for this question is used "
+                    f"({used} to {specialist_name}, {len(book['tasks'])} in all). "
+                    "Answer from what the specialists returned."
+                ),
+            }
+
+        book["count"][specialist_name] = used + 1
+        task = asyncio.ensure_future(
+            self._ask(specialist, question.strip(), context, resource_ids)
+        )
+        book["tasks"][key] = task
+        return await task
+
+    async def _ask(
+        self,
+        specialist: Specialist,
+        question: str,
+        context: str,
+        resource_ids: list[str],
+    ) -> dict:
+        """One consult, shown as a step with what was asked and what came back."""
         step_id = uuid4().hex[:12]
+        label = f"Consulting {specialist.name}"
         await record_step(self.session_id, {
             "step_id": step_id,
             "kind": "consult",
             "status": "started",
-            "label": f"Consulting {specialist_name}",
-            "name": specialist_name,
+            "label": label,
+            "name": specialist.name,
+            "question": question[:MAX_STEP_TEXT],
+            "context": context[:MAX_STEP_TEXT] or None,
         })
-        result = await consult_specialist(specialist, question.strip(), self.session_id)
-        cache[specialist_name] = result
+        result = await consult_specialist(
+            specialist, question, self.session_id, context, resource_ids
+        )
+        failed = result.get("status") == "error"
+
+        if failed:
+            _consults(self.session_id)["failed"].add(specialist.name)
+
         await record_step(self.session_id, {
             "step_id": step_id,
             "kind": "consult",
-            "status": "error" if result.get("status") == "error" else "done",
-            "label": f"Consulting {specialist_name}",
-            "name": specialist_name,
+            "status": "error" if failed else "done",
+            "label": label,
+            "name": specialist.name,
+            "reply": _reply_preview(result),
+            "findings": len(result.get("findings") or []) or None,
+            "needs": [item["what"] for item in result.get("needs") or []] or None,
+            "abstentions": result.get("abstentions") or None,
         })
         return result
+
+
+def _reply_preview(result: dict) -> str:
+    """The specialist's words, without its citation objects, for the trace."""
+    if result.get("status") == "error":
+        return str(result.get("message") or "")[:MAX_STEP_TEXT]
+
+    text = str(result.get("result") or "")
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text[:MAX_STEP_TEXT]
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("response"), str):
+        return str(parsed["response"])[:MAX_STEP_TEXT]
+
+    return text[:MAX_STEP_TEXT]
 
 
 def router_tools() -> list[dict]:
@@ -497,6 +681,25 @@ def _client_for(url: str) -> AgentClient:
     )
 
 
+# The lines a consult adds below the question. A specialist that wants them
+# splits the message on these; one that does not reads them as part of the text.
+CONTEXT_HEADING = "Context from other specialists:"
+RESOURCES_HEADING = "Use these resources:"
+
+
+def specialist_request(question: str, context: str, resource_ids: list[str]) -> str:
+    """The user message a specialist gets: the question, then context and files."""
+    parts = [question]
+
+    if context:
+        parts.append(f"{CONTEXT_HEADING}\n{context}")
+
+    if resource_ids:
+        parts.append(f"{RESOURCES_HEADING} {', '.join(resource_ids)}")
+
+    return "\n\n".join(parts)
+
+
 def specialist_instructions() -> str:
     """Prompt for a specialist: cite case files, and do not call other agents."""
     return "\n".join(
@@ -508,245 +711,65 @@ def specialist_instructions() -> str:
             "Do not call another specialist.",
             f"Citation rule: {Contract.specialist_rule()}",
             f"Answer schema, with examples: {answer.prompt_schema()}",
+            "Beside response and citations, the JSON may carry: abstentions, a list "
+            "of what your files do not say; needs, a list of what you lack to "
+            'answer, each {"what": ..., "why": ...}; and facts, the keyed values '
+            'behind your citations, each {"key": "lab.afp", "value": ..., '
+            '"unit": ..., "date": "YYYY-MM-DD", "cite": the marker it belongs to}. '
+            "A reply with needs or abstentions and nothing to cite has an empty "
+            "citations list.",
             f"Case resources: {json.dumps(case.files())}",
         ]
     )
 
 
-def _remember_citations(session_id: str, text: str) -> None:
-    """Treat files named in an accepted specialist answer as opened for the router."""
-    if session_id not in state.pending:
-        return
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return
-
-    citations = parsed.get("citations") if isinstance(parsed, dict) else None
-
-    if not isinstance(citations, list):
-        return
-
-    known = {path_key(item["web_path"]): item for item in case.files()}
-    opened = state.reads.setdefault(session_id, [])
-    seen = {path_key(item.get("web_path")) for item in opened}
-    calls = state.calls.get(session_id, {})
-    fetched = {path_key(call.get("web_path")) for call in calls.values()}
-
-    for citation in citations:
-        if not isinstance(citation, dict) or citation.get("cite"):
-            continue
-
-        ref = known.get(path_key(citation.get("web_path")))
-        key = path_key(ref.get("web_path")) if ref else ""
-
-        if ref:
-            _keep_specialist_fields(session_id, key, citation)
-
-        if ref and key not in seen and key not in fetched:
-            opened.append(ref)
-            seen.add(key)
-
-
-# ---------------------------------------------------------------------------
-# What a specialist said about a file
-#
-# The router has to repeat a specialist's citation in its own reply, and the
-# strict answer schema has no room for a slice preview, quote offsets, or a span
-# link. The server keeps the specialist's checked citation and puts those fields
-# back on whatever the router cites for the same file.
-# ---------------------------------------------------------------------------
-
-
-def _keep_specialist_fields(session_id: str, key: str, citation: dict) -> None:
-    """Remember what an accepted specialist citation said about one file."""
-    kept = state.cited.setdefault(session_id, {}).setdefault(
-        key, {"evidence": [], "conflicts": []}
-    )
-
-    for field in ("agent", "summary"):
-        value = citation.get(field)
-
-        if isinstance(value, str) and value.strip() and not kept.get(field):
-            kept[field] = value.strip()
-
-    for field in ("preview", "dicom"):
-        value = citation.get(field)
-
-        if isinstance(value, dict) and value and not kept.get(field):
-            kept[field] = value
-
-    for item in citation.get("evidence") or []:
-        if isinstance(item, dict) and item not in kept["evidence"]:
-            kept["evidence"].append(item)
-
-    conflicts = citation.get("conflicts")
-
-    if isinstance(conflicts, list) and conflicts and not kept["conflicts"]:
-        kept["conflicts"] = [item for item in conflicts if isinstance(item, dict)]
-
-
-def _dicom_record(web_path: str, preview: object) -> dict | None:
-    """DICOM slice record built from a specialist preview."""
-    if not isinstance(preview, dict) or not web_path:
-        return None
-
-    entry: dict = {"web_path": web_path}
-
-    for field in ("slice_index", "n_slices", "window", "roi"):
-        if preview.get(field) is not None:
-            entry[field] = preview[field]
-
-    if preview.get("overlay"):
-        entry["overlay"] = True
-
-    return {"previews": [entry]}
-
-
-def _same_quote(left: object, right: object) -> bool:
-    if not isinstance(left, str) or not isinstance(right, str):
-        return False
-
-    a, b = " ".join(left.lower().split()), " ".join(right.lower().split())
-    return (
-        bool(a)
-        and bool(b)
-        and (a == b or (min(len(a), len(b)) >= 12 and (a in b or b in a)))
-    )
-
-
-def _merge_evidence(sent: object, kept: list[dict]) -> list[dict]:
-    """Replace router quotes with the specialist's checked copy of the same quote.
-
-    A quote the specialist never gave is dropped: the server cannot check it, and the
-    page shows quotes as verified. If none match, the specialist's own quotes are used.
-    """
-    merged: list[dict] = []
-
-    for item in sent if isinstance(sent, list) else []:
-        if not isinstance(item, dict):
-            continue
-
-        match = next(
-            (row for row in kept if _same_quote(item.get("quote"), row.get("quote"))),
-            None,
-        )
-
-        if match is None:
-            continue
-
-        fixed = dict(match)
-
-        for field in ("n", "claim"):
-            if item.get(field) is not None:
-                fixed[field] = item[field]
-
-        merged.append(fixed)
-
-    return merged or [dict(row) for row in kept]
-
-
-def _restore_specialist_fields(session_id: str, text: str) -> str:
-    """Put specialist provenance back on the router's citations.
-
-    Agent, DICOM slice, quotes, and discrepancies come from the specialist.
-    """
-    saved = state.cited.get(session_id) or {}
-
-    if not saved:
-        return text
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return text
-
-    citations = parsed.get("citations") if isinstance(parsed, dict) else None
-
-    if not isinstance(citations, list):
-        return text
-
-    files = {path_key(item["web_path"]): item["web_path"] for item in case.files()}
-    changed = False
-
-    for item in citations:
-        if not isinstance(item, dict) or item.get("cite"):
-            continue
-
-        key = path_key(item.get("web_path"))
-        kept = saved.get(key)
-
-        if not kept:
-            continue
-
-        if kept.get("agent") and not item.get("agent"):
-            item["agent"] = kept["agent"]
-
-        if kept.get("summary") and not str(item.get("summary") or "").strip():
-            item["summary"] = kept["summary"]
-
-        if not item.get("dicom"):
-            stored = files.get(key)
-            raw_path = item.get("web_path")
-            cited_path = stored if isinstance(stored, str) else ""
-
-            if not cited_path and isinstance(raw_path, str):
-                cited_path = raw_path
-
-            record = kept.get("dicom") or _dicom_record(cited_path, kept.get("preview"))
-
-            if record:
-                item["dicom"] = record
-
-        if kept["evidence"]:
-            item["evidence"] = _merge_evidence(item.get("evidence"), kept["evidence"])
-
-        if kept["conflicts"]:
-            item["conflicts"] = kept["conflicts"]
-
-        changed = True
-
-    return json.dumps(parsed, ensure_ascii=False) if changed else text
-
-
 async def consult_specialist(
-    specialist: Specialist, question: str, session_id: str
+    specialist: Specialist,
+    question: str,
+    session_id: str,
+    context: str = "",
+    resource_ids: list[str] | None = None,
 ) -> dict:
-    """Ask one specialist, then return its answer or a tool error. Never raises."""
+    """Ask one specialist, then return its findings or a tool error. Never raises."""
     label = short_session(session_id)
     name = f"consult_{specialist.name}"
     log("server", f"session={label} consult {specialist.name}: {question}")
     conversation = Conversation(
         [
             {"role": "system", "content": specialist_instructions()},
-            {"role": "user", "content": question},
+            {
+                "role": "user",
+                "content": specialist_request(question, context, resource_ids or []),
+            },
         ],
         session_id,
         client=_client_for(specialist.url),
         tools=list(case.tools),
         consult=False,
         activity=f"Waiting for {specialist.name}",
+        by=specialist.name,
     )
     problem = ""
 
     try:
         for attempt in range(1, Question.MAX_REVISIONS + 2):
-            text = message_text(await conversation.reply())
+            reply = findings.parse_reply(_strip_fence(await conversation.reply()))
+            text = message_text(reply.body)
 
             if not text.strip():
                 problem = "The reply was empty."
                 verdict = None
             else:
                 verdict = Answer(
-                    text, [], case.files(), state.calls.get(session_id, {})
+                    text, [], case.files(), calls_by(session_id, specialist.name)
                 )
                 problem = verdict.problem or ""
 
             if verdict is not None and verdict.problem is None:
-                _remember_citations(session_id, text)
                 log("agent", f"session={label} consult {specialist.name} ok")
-                return {"status": "ok", "name": name, "result": text}
+                return findings.accept(
+                    session_id, specialist.name, reply, text, verdict
+                )
 
             log(
                 "agent",
@@ -826,15 +849,22 @@ class Question:
 
         try:
             for attempt in range(1, self.MAX_REVISIONS + 2):
-                text = message_text(await conversation.reply())
+                sent = _strip_fence(await conversation.reply())
 
                 if self.session_id not in state.pending:
                     return
 
                 await set_status(self.session_id, "Checking citations")
+                # The server's checked citation goes in behind each finding the
+                # reply cites, before the reply is judged.
+                text = message_text(findings.splice(self.session_id, sent))
                 opened = state.reads.get(self.session_id, [])
                 verdict = Answer(
-                    text, opened, case.files(), state.calls.get(self.session_id, {})
+                    text,
+                    opened,
+                    case.files(),
+                    calls_by(self.session_id, "router"),
+                    findings.known(self.session_id),
                 )
                 problem = verdict.problem or ""
 
@@ -852,9 +882,10 @@ class Question:
                     f"session={self.label} reply {attempt}/{self.MAX_REVISIONS + 1} "
                     f"refused: {problem}",
                 )
-                log("agent", f"session={self.label} refused reply was: {text}")
+                sent = message_text(sent)
+                log("agent", f"session={self.label} refused reply was: {sent}")
                 conversation.messages += [
-                    {"role": "assistant", "content": text},
+                    {"role": "assistant", "content": sent},
                     {"role": "user", "content": verdict.correction()},
                 ]
                 conversation.activity = "Revising the answer"
@@ -868,12 +899,15 @@ class Question:
             log("server", f"session={self.label} agent failed: {exc}")
             await self._deliver(f"The agent failed: {exc}")
         finally:
-            state.consulted.pop(self.session_id, None)
-            state.cited.pop(self.session_id, None)
+            state.consults.pop(self.session_id, None)
+            state.findings.pop(self.session_id, None)
 
     def _answer_format(self) -> dict | None:
-        """The answer schema, once a describe or fetch means the reply must be cited."""
-        return answer.response_format() if state.calls.get(self.session_id) else None
+        """The answer schema, once a read or a finding means the reply must be cited."""
+        cited = calls_by(self.session_id, "router") or state.findings.get(
+            self.session_id
+        )
+        return answer.response_format() if cited else None
 
     def _instructions(self) -> str:
         lines = [
@@ -891,12 +925,33 @@ class Question:
             lines.append(
                 "Specialists: " + roster + ". "
                 "Call consult_<name> with the part of the question that specialist "
-                "answers. "
-                "Call each specialist at most once. "
-                "When a specialist returns citation JSON, copy those citations into "
-                "your own reply. "
+                "answers. Calls made in one turn run at the same time. "
+                "A specialist's reply lists findings, each with an id such as "
+                "notes.1. Cite a finding by putting [cite:notes.1] right after the "
+                "words it supports. Do not copy its citation: the server attaches "
+                "the checked one, and citations then lists only files you read "
+                "yourself. "
+                "needs lists what a specialist lacks to answer. Get it from another "
+                "specialist, then ask the first one again with that as context. "
+                "abstentions lists what its files do not say. "
+                f"A specialist can be asked up to {MAX_CONSULTS_PER_SPECIALIST} "
+                "times, with a new question, with context, or with resource_ids "
+                "naming the files to use. "
                 "If a specialist returns an error, say so and answer from the others."
             )
+
+            owned = "; ".join(
+                f"{_MODALITY_WORDS.get(modality, modality).lower()} through "
+                f"consult_{spec.name}"
+                for spec in state.specialists.values()
+                for modality in spec.modalities
+            )
+
+            if owned:
+                lines.append(
+                    f"Read {owned}, not with describe or fetch. "
+                    "Those tools answer with an error for such a file."
+                )
 
         return "\n".join(lines)
 
@@ -906,13 +961,15 @@ class Question:
             return
 
         calls = state.calls.get(self.session_id, {})
-        message = _restore_specialist_fields(self.session_id, message)
         message = case.expand_citations(message, calls)
         message = case.name_sources(message, calls)
+        message = case.stamp_basis(message, calls)
+        message = findings.keep_discrepancies(self.session_id, message)
         state.pending.discard(self.session_id)
         state.reads.pop(self.session_id, None)
         state.calls.pop(self.session_id, None)
-        state.cited.pop(self.session_id, None)
+        state.findings.pop(self.session_id, None)
+        state.consults.pop(self.session_id, None)
 
         session = state.sessions[self.session_id]
         steps = [dict(item) for item in session.steps]

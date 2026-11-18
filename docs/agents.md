@@ -32,7 +32,7 @@ The system message for a question contains:
 
 Each resource in that list has `id`, `modality` (`note`, `structured`, or `dicom`), `label`, and `web_path`. `web_path` is the file's URL on this server, such as `/case/clinic_note.txt`. Paths are URL-encoded per segment. The list is the `resources` array from the discovery report.
 
-The tools are `discover`, `describe`, `fetch`, `links`, `assert_link`, `dicom_tree`, and `dicom_groups`. Their schemas come from datactrl. `root` and `case_id` are removed from every schema, including `required`. The server drops those two arguments if the agent sends them, and sets `root` to the folder it opened before it runs the tool.
+The tools are `discover`, `describe`, `fetch`, `notes_search`, `links`, `assert_link`, `dicom_tree`, and `dicom_groups`. Their schemas come from datactrl. `root` and `case_id` are removed from every schema, including `required`. The server drops those two arguments if the agent sends them, and sets `root` to the folder it opened before it runs the tool.
 
 A tool result comes back as a `tool` message whose content is JSON:
 
@@ -71,10 +71,16 @@ A markdown fence around that JSON is removed. Any other shape, invalid JSON, or 
 [notes]
 url = "http://127.0.0.1:8002/v1"
 description = "Answers from clinical notes with verified quotes, dates, and conflicts."
+modalities = ["note"]
 
 [imaging]
 url = "http://127.0.0.1:8003/v1"
 description = "Looks at one DICOM slice. Use this for questions about the images, scans, contours, or what is visible on imaging."
+
+[tabular]
+url = "http://127.0.0.1:8004/v1"
+description = "Answers from the case's tables: a value on a date, a trend, and scores."
+modalities = ["structured"]
 ```
 
 ```bash
@@ -83,11 +89,81 @@ pixi run serve /path/to/folder --agent-url http://127.0.0.1:8001/v1 --agents con
 
 `--specialist notes=http://127.0.0.1:8002/v1` does the same for one agent, and can be repeated. A name is a short lowercase word. The same name cannot be listed twice.
 
-The router is given one extra tool per specialist, `consult_notes`, `consult_imaging`, and so on. The description is the only routing hint. The server runs that call: it posts the question and the datactrl tools to the specialist, and does not give the specialist a `consult_` tool, so agents cannot call each other. Each specialist is called at most once per question; a second call returns the first result. A timeout, an HTTP error, or citations that still fail after six corrections become a tool error. The router can still answer from the specialists that succeeded.
+### Consulting a specialist
 
-A specialist may answer in plain text, or with the citation JSON below. A `describe` or `fetch` it calls comes back with a `cite` token, and that token is what the citation names. A specialist that reads the case itself, without those tools, cites the file's `web_path` instead. Files it cites count as opened, so the router's own reply has to cite them too. With no specialists registered, none of this is added and the server talks only to `--agent-url`.
+The router is given one extra tool per specialist, `consult_notes`, `consult_tabular`, and so on. The description is the routing hint. The call takes:
 
-The router has to repeat a specialist's citation in its own reply, and the answer schema has no room for a slice preview, quote offsets, or a span link. So the server keeps each accepted specialist citation, and before the page sees the reply it puts the specialist's `agent`, DICOM slice (a `preview` of `slice_index`, `window`, and `overlay` becomes the same `dicom` record a fetched slice gets), checked `evidence`, and `conflicts` back on the router's citation for the same file. A router quote that matches none of the specialist's quotes is dropped, because the server cannot check it. Any citation that still names no agent is given the one for its file: `clinical_notes`, `imaging`, or `structured`.
+| Argument | Meaning |
+|---|---|
+| `question` | What the specialist should answer. Required. |
+| `context` | What other specialists found that this one needs. |
+| `resource_ids` | Case resource ids the specialist should use. |
+
+The server runs the call. It posts the question and the datactrl tools to the specialist. Context and resource ids follow the question in the same message, under the lines `Context from other specialists:` and `Use these resources:`. A specialist is not given a `consult_` tool, so specialists cannot call each other.
+
+Consult calls sent in one turn run at the same time. A specialist can be consulted up to three times per question, and a question can make eight consults in all. The same call made twice gets the first answer and does not count. Past the budget the call returns a tool error. A timeout, an HTTP error, or citations that still fail after six corrections also become a tool error, and the router can still answer from the specialists that succeeded.
+
+### What a specialist returns
+
+A specialist may answer in plain text, or with the citation JSON below. A `describe` or `fetch` it calls comes back with a `cite` token, and that token is what the citation names. A specialist that reads the case itself, without those tools, cites the file's `web_path` instead.
+
+Beside `response` and `citations`, the JSON may carry:
+
+| Key | Value |
+|---|---|
+| `abstentions` | A list of what the specialist's files do not say. |
+| `needs` | A list of what it lacks to answer. Each item is `{"what": …, "why": …}`, with `options` when the caller can choose, such as series ids. |
+| `facts` | The keyed values behind its citations. Each item is `{"key": "lab.afp", "value": …, "unit": …, "date": "YYYY-MM-DD", "cite": the marker it belongs to}`, with optional `assertion` and `source_type`. |
+
+A reply with needs or abstentions and nothing to cite has an empty `citations` list, and is checked as plain text.
+
+### Findings
+
+The server checks a specialist's reply once, when it arrives. Each usable citation becomes a finding with an id: `notes.1`, `notes.2`, `tabular.1`. The server fills the citation in as it does for the router (file, `web_path`, command, DICOM slice, table record, quote offsets) and keeps it.
+
+The consult call returns:
+
+```json
+{
+  "status": "ok",
+  "name": "consult_notes",
+  "result": "{\"response\": \"Treatment finished on 13 February [cite:notes.1].\", \"citations\": [...]}",
+  "findings": [{"id": "notes.1", "text": "Treatment finished on 13 February [cite:notes.1].", "kind": "file", "file": "2006-02-13-rt-completion.txt", "agent": "clinical_notes"}],
+  "abstentions": ["The reason for the two-day gap is not documented."],
+  "needs": [],
+  "facts": [{"key": "rt.end_date", "value": "2006-02-13", "finding": "notes.1"}]
+}
+```
+
+`result` is the specialist's reply with its markers renamed to finding ids. Its citations carry only `id`, `kind`, `file`, `web_path`, `agent`, and `summary`.
+
+The router cites a finding by its id: it puts `[cite:notes.1]` after the words the finding supports. It does not copy the citation. Before the reply is checked, the server puts its own checked citation behind every finding the reply cites, with `finding` set to the id. A citation the router sends for a finding id is dropped. `citations` then lists only files the router read itself, and is empty when every marker names a finding. A plain-text reply may cite findings the same way.
+
+Three things follow from that:
+
+- A marker shaped like a finding id that no specialist returned is refused.
+- A read a specialist made cannot be cited by the router with that read's cite token. The token belongs to the specialist.
+- When specialists returned findings and the router opened nothing itself, the router cannot cite a case file by `web_path`. It cites the finding.
+
+A router may also send `discrepancies`: the values different findings give for one attribute. Each item has `attribute`, `values` (each with `value` and the `finding` it came from, and optional `unit`, `date`, and `side`), and optional `kind`, `severity`, `rationale`, and `preferred` (a finding id). The server keeps an item when at least two of its values name different findings it holds, adds each value's specialist and file, and adds any of those findings' citations the answer does not already carry.
+
+### Who reads which files
+
+A specialist may list `modalities` it owns: `note`, `structured`, or `dicom`. Each modality has at most one owner. For a file of an owned modality, the router's own `describe` and `fetch` return a tool error that names the specialist to consult. `notes_search` does the same when a specialist owns `note`. What the page shows for those files is then what the specialist found and the server checked.
+
+If the owning specialist fails on a question, the router may read its files for the rest of that question. The patient-card request is not held to ownership. A specialist with no `modalities` owns nothing, and the router may read those files as before.
+
+Every delivered citation says what it rests on, under `basis`:
+
+| Field | Values |
+|---|---|
+| `type` | `quote` (a passage of a note), `cell` (table cells), `computed` (a value code worked out from a table), `model_read` (a model's description of an image), `metadata`, or `file`. |
+| `checked` | `server` when this server compared the evidence with the file, `specialist` when only the specialist did, `none` otherwise. |
+| `by` | `router`, or the specialist's name. |
+
+A citation that names no agent is given the one for its file: `clinical_notes`, `imaging`, or `structured`. `basis.by` says whether the router or a specialist read it.
+
+With no specialists registered, none of this is added and the server talks only to `--agent-url`.
 
 ## Clinical notes specialist
 
@@ -97,9 +173,12 @@ The notes specialist is `pixi run notes --case /path/to/case` from the root of t
 [notes]
 url = "http://127.0.0.1:8002/v1"
 description = "Answers from clinical notes with verified quotes, dates, and conflicts. Use this for questions about the chart, history, labs in notes, and discrepancies between notes."
+modalities = ["note"]
 ```
 
-It opens that case itself and returns citation JSON. Each citation is tagged `clinical_notes` and carries the verified quotes and documented discrepancies, which the page shows on the badge, the hover card, and the source viewer. It does not ask the server to read files.
+It opens that case itself and returns citation JSON. Each citation is tagged `clinical_notes` and carries the verified quotes and documented discrepancies, which the page shows on the badge, the hover card, and the source viewer. It does not ask the server to read files, so its quotes reach the page with `basis.checked` set to `specialist`: the notes specialist located and entailment-checked them, and the server did not re-read the note.
+
+Beside its citations it sends `abstentions` (what the notes do not document) and `facts` (the ledger facts behind each cited claim, keyed by attribute such as `social_history.smoking`). Context from a consult is shown to its model to frame the question. It is never cited, and every claim is still verified against the notes.
 
 ## Imaging specialist (stand-in)
 
@@ -111,11 +190,32 @@ url = "http://127.0.0.1:8003/v1"
 description = "Looks at one DICOM slice. Use this for questions about the images, scans, contours, or what is visible on imaging."
 ```
 
-It ranks the case's series against the question, renders one preview slice (with contours for an RTSTRUCT or when the question asks for them), and describes that slice with a vision model (Gemini). A confident pick becomes one citation for the series file, tagged `imaging`, with a `preview` of the slice index, window, and overlay; the page loads that slice from `/api/dicom/preview`. If no series ranks confidently, the reply is plain text listing the candidates and has no citation. Any agent can take its place as long as it answers the same way.
+It ranks the case's series against the question, renders one preview slice (with contours for an RTSTRUCT or when the question asks for them), and describes that slice with a vision model (Gemini). A confident pick becomes one citation for the series file, tagged `imaging`, with a `preview` of the slice index, window, and overlay; the page loads that slice from `/api/dicom/preview`. Its citations reach the page with `basis.type` `model_read` and `checked` `none`.
+
+If no series ranks confidently, the reply cites nothing and lists the ranked series ids under `needs` as `options`. A consult that passes one of them in `resource_ids` reads that series. The stand-in owns no modality, so the router may still fetch series metadata and volumes itself. Any agent can take its place as long as it answers the same way.
+
+## Tabular specialist
+
+`pixi run tabular --case /path/to/case` starts it on `http://127.0.0.1:8004/v1`. Register it with `modalities = ["structured"]`. It reads tables through the server's `fetch`, so it is not a stand-alone `--agent-url`. [Tabular specialist](specialists/tabular.md) describes how it answers.
+
+## The orchestrator
+
+`pixi run orchestrator` serves `meddataos.orchestrator.serve` on `http://127.0.0.1:8001/v1`, and `pixi run stack` starts it as the router. It reads the same model settings as the example agent. With no specialists registered, each request goes to the model as it came, as with the example agent.
+
+With specialists, each question runs as steps in code. The server holds the conversation, so each request carries the question so far and the orchestrator keeps no state between requests.
+
+| Step | Who decides |
+|---|---|
+| Plan | A model writes a stand-alone question for each specialist that holds part of the answer. Code sends them as consult calls in one turn. If the plan fails, every specialist is asked the question as written. A message that needs no patient data, such as a greeting, is answered without consulting. |
+| Reconcile | Code. Findings, abstentions, needs, and errors are gathered. A finding a specialist repeats when asked again is kept once. The keyed facts of every specialist go into one store, and the values sources disagree on become `discrepancies`. |
+| Gap check | Code first: a specialist whose need another specialist has answered is asked again with those findings as `context`, for the part that was waiting only. A model is asked only when a need has no supplier yet, or the first round left something undocumented. It says whether a finding in hand already answers the need, which specialist could supply it, or which option to pick. Questions already asked are not repeated, and the per-specialist budget is respected. Consulting stops after three rounds. |
+| Write | A model writes the answer from the findings, citing each by id. Code repairs markers that sit side by side or stand alone, drops markers for findings that do not exist, and checks that every number and date in a cited sentence is in the finding it cites. One rewrite is asked for. After that, or after the server refuses twice, the answer is the specialists' own sentences, stitched in code. |
+
+Sources that disagree are compared with the notes specialist's conflict logic (`meddataos.specialists.facts`): a static attribute across all dates, a time-varying one on the same date only, numbers within measurement tolerance. Within one source, disagreement is left to that source. When more sources record one value than any other, that value is preferred. Otherwise the more reliable source is: pathology; then a lab table or final radiology; then operative notes or image measurements; then physician notes, preliminary radiology, or chart tables; then nursing phone notes; then research forms or registry rows.
 
 ## Azure OpenAI
 
-The example router speaks Azure when these are set in this repo's `.env`. The notes and imaging specialists read the same variables from the same file:
+The example router and the orchestrator speak Azure when these are set in this repo's `.env`. The notes, imaging, and tabular specialists read the same variables from the same file:
 
 ```bash
 AZURE_OPENAI_API_KEY=
@@ -186,6 +286,10 @@ If a file was opened, the whole answer must be one JSON object that matches `Cit
 
 Each citation has a `kind`, and the kind follows from the call its token came from: `imaging` for a DICOM series, `note` for a clinical note, `table` for a table, and `file` for a path cited without a token. An imaging citation has only `cite`, `summary`, and `fields`. A finding from a note is a separate note citation, with the token from that note's own fetch. When the claim is a calculation or prediction from a call (for example a structure volume from a volume fetch), use `kind` `derived` with that call's cite token, a plain-language `method`, a `summary`, and `inputs`. Each input is an object with `cite` (a token from this question), `label` (what was taken from that call), and optional `detail`. `result` (`value` / `unit`) and `detail` on the citation stay optional. The server refuses an imaging citation that carries `evidence`, `agent`, or `conflicts`, and any citation whose kind does not match its call (except `derived`, which is allowed on any cite token). When `kind` is missing, the server uses the kind of the call.
 
+A table citation may name `cells`: each is `{"row": …, "column": …, "value": …}`. `row` is the row's position in the file, as `row_numbers` on a rows fetch or `row` on a series point gives it. On a series fetch `column` may be left out. The server refuses a cell the call did not return, an empty cell, and a value that is not the cell's. When `value` is left out the server fills it in. A derived citation of a table call must give `result.value`, and that value has to be one a table call it names returned: a number from a series summary (first, last, lowest, highest, change, percent change) or a score. Rounding may move it by at most half its last digit, and by at most 5 percent. The server refuses a value worked out from cells by hand.
+
+A delivered table citation carries `table`, the server's record of the call: the cited rows of a rows fetch, every point and the summary of a series, or the inputs, points, and result of a score. The page draws its chart and marks its cells from that record, not from what the agent wrote.
+
 The system message includes the JSON schema of `CitedAnswer`, with its descriptions and examples. After the first `describe` or `fetch` in a question, the router's requests also send a strict copy of that schema as `response_format` (`type: json_schema`, `strict: true`), so a model that supports structured outputs replies in this shape. If the endpoint answers 400 or 422, the server retries that conversation without `response_format`, and then without tools. The schema checks the shape. The server still checks the references: the token is a call from this question, each quote is in the note, and where the markers sit.
 
 Put `[cite:token]` right after the words that call supports. A sentence may cite several calls, but the markers cannot sit side by side or be grouped at the end of the answer. `cite` is the token on the `describe` or `fetch` result, and the marker uses that same token. The server fills in `id`, `file`, `web_path`, and the command before the page sees the reply. The summary is two or three sentences of what that call shows: the finding, the date, and the measurement, so a reviewer can check the card without opening the file. A DICOM metadata citation may include `fields`, the metadata keys that support the claim. The values stay on the server. A `derived` citation's `method` is one or two sentences of how the value was obtained (input call, ROI or series, resampling or model, and the arithmetic or prediction step), readable without opening code. Read a note with `fetch` `view=text`. A citation of that call must include `evidence` with `quote`, a contiguous passage copied from the `text` that fetch returned. Several claims from one fetch are several evidence items on that one citation, each with its own `quote` from that same text, and the same `[cite:token]` goes after each of those claims. The server finds each passage, sets `start` and `end`, and fills `span_url`. It refuses a quote that is not in the note, and it refuses a quote that is the whole note. When notes disagree, the citation also sends `conflicts`. A specialist that did not call those tools cites `web_path` instead, with an `id` such as `1`, and that path must be a file in the open case. It may send `span_url` itself.
@@ -196,7 +300,7 @@ Anything other than a chat completion (`choices[0].message` as an object), a con
 
 ## The example agent
 
-`pixi run agent` runs `examples/agent.py`. It listens on `127.0.0.1:8001` unless you pass `--host` and `--port`, and it accepts only `POST /v1/chat/completions`.
+`pixi run agent` runs `examples/agent.py`. `pixi run stack --router example` uses it in place of the orchestrator. It listens on `127.0.0.1:8001` unless you pass `--host` and `--port`, and it accepts only `POST /v1/chat/completions`.
 
 It replaces `model` with `OPENAI_MODEL` and posts `messages`, plus `tools` and `response_format` when the request includes them, to `OPENAI_BASE_URL`. When `OPENAI_BASE_URL` is unset it uses `https://api.openai.com/v1`. `OPENAI_API_KEY` is sent as a bearer token when set. The example agent's own wait is 120 seconds. `AGENT_MODEL`, `AGENT_API_KEY`, and `AGENT_TIMEOUT` apply to the MedDataOS server's call, which this forwarder does not read.
 

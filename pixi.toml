@@ -9,7 +9,7 @@ version = "0.2.0"
 python = ">=3.13,<3.14"
 
 [pypi-dependencies]
-meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists"] }
+meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists", "orchestrator"] }
 
 [environments]
 default = ["style", "docs"]
@@ -19,8 +19,10 @@ library = { features = ["library"], no-default-feature = true }
 stack = { cmd = "python scripts/stack.py", description = "Start the router, specialists, and web server for one case" }
 serve = "python -m meddataos.server"
 agent = "python examples/agent.py"
+orchestrator = "python -m meddataos.orchestrator.serve"
 notes = "python -m meddataos.specialists.notes.serve"
 imaging = "python -m meddataos.specialists.imaging.serve"
+tabular = "python -m meddataos.specialists.tabular.serve"
 test = "pytest tests"
 
 ############################################## STYLE ###############################################

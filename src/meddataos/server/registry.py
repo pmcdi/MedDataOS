@@ -5,6 +5,11 @@ one router at --agent-url. Each specialist is offered to that router as a
 consult_<name> tool. With no specialists registered, the server behaves as a
 single agent.
 
+A specialist may own modalities (``note``, ``structured``, ``dicom``). The
+router then reads those files through the specialist and not with its own
+describe or fetch, so what the page shows for them is what the specialist
+checked.
+
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
+MODALITIES = ("note", "structured", "dicom")
 
 
 @dataclass(frozen=True)
@@ -24,6 +30,7 @@ class Specialist:
     name: str
     url: str
     description: str
+    modalities: tuple[str, ...] = ()
 
     def tool(self) -> dict:
         """OpenAI tool the router uses to call this specialist."""
@@ -38,6 +45,21 @@ class Specialist:
                         "question": {
                             "type": "string",
                             "description": "What this specialist should answer.",
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": (
+                                "What other specialists found that this one needs, "
+                                "such as a value it listed under needs."
+                            ),
+                        },
+                        "resource_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Case resource ids this specialist should use, "
+                                "when the question is about particular files."
+                            ),
                         },
                     },
                     "required": ["question"],
@@ -94,7 +116,29 @@ def _from_toml(path: Path) -> dict[str, Specialist]:
         if not isinstance(description, str):
             raise SystemExit(f"Specialist {name} description must be a string")
 
-        found[str(name)] = _make(str(name), body["url"], description)
+        modalities = body.get("modalities", [])
+
+        if not isinstance(modalities, list) or any(
+            item not in MODALITIES for item in modalities
+        ):
+            raise SystemExit(
+                f"Specialist {name} modalities must be a list of: "
+                f"{', '.join(MODALITIES)}"
+            )
+
+        found[str(name)] = _make(str(name), body["url"], description, tuple(modalities))
+
+    owners: dict[str, str] = {}
+
+    for specialist in found.values():
+        for modality in specialist.modalities:
+            if modality in owners:
+                raise SystemExit(
+                    f"Both {owners[modality]} and {specialist.name} "
+                    f"list the modality {modality}"
+                )
+
+            owners[modality] = specialist.name
 
     return found
 
@@ -108,7 +152,9 @@ def _from_flag(flag: str) -> Specialist:
     return _make(name.strip(), url.strip(), "")
 
 
-def _make(name: str, url: str, description: str) -> Specialist:
+def _make(
+    name: str, url: str, description: str, modalities: tuple[str, ...] = ()
+) -> Specialist:
     if not _NAME.fullmatch(name):
         raise SystemExit(
             f"Specialist name {name!r} must be a short lowercase word, such as notes"
@@ -118,4 +164,4 @@ def _make(name: str, url: str, description: str) -> Specialist:
         raise SystemExit(f"Specialist {name} url must start with http:// or https://")
 
     text = description.strip() or f"Consult the {name} specialist."
-    return Specialist(name, url.rstrip("/"), text)
+    return Specialist(name, url.rstrip("/"), text, modalities)

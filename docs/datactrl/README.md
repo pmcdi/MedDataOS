@@ -18,9 +18,15 @@ print(report.to_dict())       # full resource list
 for ref in report.resources:
     print(case.describe(ref.id)["views"])
 
-# Structured rows
+# Structured rows; describe gives column types, the table's shape, and its tests
 for table in report.structured:
+    print(case.describe(table.id)["summary"]["shape"])
     print(case.fetch(table.id, view="rows", limit=10))
+labs = report.structured[0].id
+case.fetch(labs, view="rows", where=[{"column": "test", "value": "AFP"}], order_by="-collected_at")
+case.fetch(labs, view="series", item="AFP", from_date="2011-04-15")   # one unit, with a summary
+case.fetch(labs, view="score", name="child_pugh", at="2011-03-10",
+           inputs={"ascites": "none", "encephalopathy": "none"})       # missing inputs are listed, not guessed
 
 # Notes (meta: note_date + confidence/flags, note_type, text_quality)
 for note in report.notes:

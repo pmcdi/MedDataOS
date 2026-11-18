@@ -31,6 +31,13 @@ SOURCE_RELIABILITY = {
     "nursing_phone": 5,
     "research_form": 6,
     "unknown": 7,
+    # Sources outside the notes, used when notes are compared with tables and
+    # images. They are not in SOURCE_TYPES, which is what the note extractor
+    # may choose from.
+    "lab_table": 1,            # a lab system export: the result as reported
+    "imaging_measurement": 2,  # measured on the images
+    "chart_table": 3,          # entered at the visit, like a physician note
+    "registry": 6,             # abstracted afterwards, like a research form
 }
 
 
