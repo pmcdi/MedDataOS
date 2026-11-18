@@ -2,6 +2,12 @@
 
 DEFAULT_TABLE_LIMIT = 20
 MAX_TABLE_LIMIT = 1_000
+# Points one series returns, and items describe lists for a long table.
+MAX_SERIES_POINTS = 2_000
+MAX_TABLE_ITEMS = 80
+# Rows of one table that are typed, filtered, and read as series. A longer file
+# is read up to this row and says so.
+MAX_TYPED_ROWS = 200_000
 
 DEFAULT_NOTE_CHARS = 4_000
 MAX_NOTE_CHARS = 200_000

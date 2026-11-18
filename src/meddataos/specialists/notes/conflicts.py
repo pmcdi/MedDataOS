@@ -63,6 +63,9 @@ def _same(a: Fact, b: Fact, attribute: str) -> str:
     if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
         if va == vb:
             return "same"
+        # An age in whole years is the floor of an age given with decimals.
+        if attribute == "demographics.age" and int(va) == int(vb):
+            return "same"
         if not attribute.startswith(CONTINUOUS_PREFIXES):
             return "different"
         diff = abs(va - vb)
@@ -186,9 +189,11 @@ def _is_static(fact: Fact) -> bool:
     return fact.attribute.startswith(STATIC_PREFIXES) or fact.category in _CATEGORY_TO_STATIC
 
 
-def _value_conflicts(
-    facts: list[Fact], outlier_notes: frozenset[str] = frozenset()
-) -> list[dict[str, Any]]:
+def _value_groups(facts: list[Fact]) -> dict[tuple, list[Fact]]:
+    """Facts that can be compared with each other.
+
+    A static attribute is one group. A time-varying one is one group per date.
+    """
     groups: dict[tuple, list[Fact]] = {}
     for fact in facts:
         if fact.assertion not in {"present", "historical"}:
@@ -205,6 +210,13 @@ def _value_conflicts(
         else:
             continue
         groups.setdefault(key, []).append(fact)
+    return groups
+
+
+def _value_conflicts(
+    facts: list[Fact], outlier_notes: frozenset[str] = frozenset()
+) -> list[dict[str, Any]]:
+    groups = _value_groups(facts)
 
     out: list[dict[str, Any]] = []
     for key, members in groups.items():
@@ -351,6 +363,96 @@ def _date_conflicts(notes: list[dict[str, Any]], timeline: list[dict[str, Any]])
                 ),
             }
         )
+    return out
+
+
+def _assertion_sides(members: list[Fact], attribute: str) -> tuple[list[Fact], list[Fact]]:
+    """Facts that say an attribute is present and facts that negate it, when they clash."""
+    present = [f for f in members if _polarity(f) == "present"]
+    negated = [f for f in members if _polarity(f) == "negated"]
+    specific_history = attribute.startswith("social_history.")
+    clash = any(
+        specific_history
+        or _same(p, n, attribute) == "same"
+        or not str(n.normalized_value or "").strip()
+        or n.normalized_value in _NEGATIVE_VALUES
+        for p in present for n in negated
+    )
+    return (present, negated) if clash else ([], [])
+
+
+def cross_source_conflicts(by_source: dict[str, list[Fact]]) -> list[dict[str, Any]]:
+    """Disagreements between sources, such as the notes and a table.
+
+    Facts are compared the way notes are compared with each other: a static
+    attribute across all dates, a time-varying one only on the same date, and
+    numbers within measurement tolerance. A record is returned when the values
+    disagree and more than one source is involved. Every side lists one value
+    per source, so a table that agrees with one of two disagreeing notes shows
+    as support for that note. Disagreement inside a single source is left to
+    that source.
+    """
+    source_of = {id(f): source for source, facts in by_source.items() for f in facts}
+    everything = [f for facts in by_source.values() for f in facts]
+    out: list[dict[str, Any]] = []
+
+    def record(attribute: str, kind: str, sides: list[list[Fact]]) -> None:
+        if len(sides) < 2 or len({source_of[id(f)] for side in sides for f in side}) < 2:
+            return
+        values, reps = [], []
+        for index, side in enumerate(sides):
+            per_source: dict[str, Fact] = {}
+            for fact in sorted(side, key=_rank):
+                per_source.setdefault(source_of[id(fact)], fact)
+            reps.append(min(per_source.values(), key=_rank))
+            values += [
+                {**_value_entry(fact), "source": source, "side": index}
+                for source, fact in per_source.items()
+            ]
+        dates = [d for d in (_cmp_date(f) for f in reps) if d]
+        spread = (max(dates) - min(dates)).days if len(dates) > 1 else 0
+        backing = [
+            sorted({v["source"] for v in values if v["side"] == index})
+            for index in range(len(sides))
+        ]
+        most = max(len(sources) for sources in backing)
+        if most > 1 and sum(1 for sources in backing if len(sources) == most) == 1:
+            # One side is recorded by more sources than any other: independent
+            # agreement outweighs which single source is newer or more reliable.
+            index = next(i for i, sources in enumerate(backing) if len(sources) == most)
+            preferred = reps[index]
+            rationale = (
+                f"{preferred.value!r} is recorded by {' and '.join(backing[index])}. "
+                "No other value is recorded by more than one source."
+            )
+            if spread > TIME_GAP_DAYS:
+                rationale += " Values were documented more than a year apart and may reflect a real change."
+        else:
+            preferred = min(reps, key=_rank)
+            rationale = _rationale("discordant", preferred, reps, spread, {f.source_type for f in reps})
+        out.append({
+            "conflict_id": _conflict_id(attribute, [v["fact_id"] for v in values]),
+            "attribute": attribute,
+            "kind": kind,
+            "severity": _severity(attribute, "discordant", reps, spread),
+            "values": values,
+            "preferred": {**_value_entry(preferred), "source": source_of[id(preferred)]},
+            "rationale": rationale,
+        })
+
+    for key, members in _value_groups(everything).items():
+        record(key[0], "cross_source", _cluster(members, key[0]))
+
+    by_attribute: dict[str, list[Fact]] = {}
+    for fact in everything:
+        if fact.attribute.startswith(ASSERTION_PREFIXES) and fact.assertion in {"present", "negated"}:
+            by_attribute.setdefault(fact.attribute, []).append(fact)
+    for attribute, members in by_attribute.items():
+        present, negated = _assertion_sides(members, attribute)
+        if present and negated:
+            record(attribute, "cross_source_assertion", [present, negated])
+
+    out.sort(key=lambda c: (_SEVERITY_ORDER.get(c["severity"], 9), c["attribute"]))
     return out
 
 

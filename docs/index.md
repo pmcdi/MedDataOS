@@ -12,7 +12,7 @@ Copy `.env.example` to `.env`, then from the repository root:
 pixi run stack data/TCGA-DD-A4NF
 ```
 
-That starts the example agent, the specialists in `configs/agents.toml`, and the server. Ctrl-C stops them. To start the pieces yourself, run `pixi run agent` and then:
+That starts the orchestrator as the router, the specialists in `configs/agents.toml` (notes, imaging, and tabular), and the server. `--router example` uses the example agent instead. Ctrl-C stops them. To start the pieces yourself, run `pixi run agent` and then:
 
 ```bash
 pixi run serve /path/to/folder --agent-url http://127.0.0.1:8001/v1
@@ -51,7 +51,7 @@ sequenceDiagram
     Page-->>User: Answer in the chat
 ```
 
-[Connect an agent](agents.md) is the request and citation contract. [Page](page.md) is what the browser shows. [Notes](specialists/notes.md) and [DICOM](specialists/dicom.md) are optional specialists the router can call.
+[Connect an agent](agents.md) is the request and citation contract. [Page](page.md) is what the browser shows. [Notes](specialists/notes.md), [DICOM](specialists/dicom.md), and [tabular](specialists/tabular.md) are optional specialists the router can call. [The orchestrator](agents.md#the-orchestrator) is the router that plans, consults, reconciles, and gap-checks in code.
 
 ## Settings
 
@@ -64,5 +64,5 @@ Names match `.env.example`.
 | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` | Azure, for the example agent and the specialists, when all three are set. |
 | `AZURE_OPENAI_API_VERSION` | Azure API date, such as `2024-10-21`. |
 | `AZURE_OPENAI_REASONING_EFFORT` | Set to `none` when a reasoning model refuses function tools. |
-| `GEMINI_API_KEY` | Notes when Azure is not set. |
+| `GEMINI_API_KEY` | Notes and tabular when Azure is not set. |
 | `HOST`, `PORT` | Page bind address. Defaults are `127.0.0.1` and `8080`. |

@@ -26,6 +26,7 @@ nav:
   - Specialists:
       - Notes: specialists/notes.md
       - DICOM: specialists/dicom.md
+      - Tabular: specialists/tabular.md
   - datactrl:
       - API: datactrl/README.md
       - Design: datactrl/DESIGN.md

@@ -31,6 +31,10 @@ specialists = [
     "python-dateutil>=2.9",
     "python-dotenv>=1.0.0,<2",
 ]
+# The orchestrator compares facts with the notes specialist's conflict logic.
+orchestrator = [
+    "meddataos[specialists]",
+]
 dicom = [
     "meddataos[datactrl]",
     "openai-agents>=0.24,<0.25",

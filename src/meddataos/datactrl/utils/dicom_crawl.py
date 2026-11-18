@@ -25,6 +25,7 @@ from meddataos.datactrl.utils.rtstruct import (
 _HEADER_TAGS = (
     "SeriesDescription",
     "StudyDescription",
+    "StudyDate",
     "ImageType",
     "ImagePositionPatient",
 )
@@ -52,6 +53,9 @@ def enrich_series_meta(
     protocol = _meta_str(flat, "ProtocolName")
     study = _meta_str(flat, "StudyDescription") or _meta_str(header, "StudyDescription")
     body = _meta_str(flat, "BodyPartExamined")
+    study_date = _iso_date(
+        _meta_str(flat, "StudyDate") or _meta_str(header, "StudyDate")
+    )
     image_type = _meta_image_type(flat) or _meta_image_type(header)
     mod = _meta_str(flat, "Modality") or (modality or "")
     blob = " ".join(part for part in (description, protocol, study) if part)
@@ -68,6 +72,8 @@ def enrich_series_meta(
             mask_meta.setdefault("ProtocolName", protocol)
         if study:
             mask_meta.setdefault("StudyDescription", study)
+        if study_date:
+            mask_meta.setdefault("StudyDate", study_date)
         return {key: value for key, value in mask_meta.items() if value is not None}
 
     z_first = _z_from_header(header)
@@ -84,6 +90,7 @@ def enrich_series_meta(
         "SeriesDescription": description,
         "ProtocolName": protocol,
         "StudyDescription": study,
+        "StudyDate": study_date,
         "BodyPartExamined": body,
         "ImageType": image_type,
         "series_kind": classify_series_kind(image_type, blob, mod),
@@ -260,6 +267,14 @@ def _meta_str(flat: Mapping[str, Any], key: str) -> str | None:
         if text:
             return text
     return None
+
+
+def _iso_date(value: str | None) -> str | None:
+    """A DICOM date (YYYYMMDD) as YYYY-MM-DD, or None when it is not one."""
+    digits = (value or "").strip()[:8]
+    if len(digits) != 8 or not digits.isdigit():
+        return None
+    return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
 
 
 def _meta_image_type(flat: Mapping[str, Any]) -> list[str] | None:

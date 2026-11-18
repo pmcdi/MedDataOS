@@ -9,7 +9,7 @@ The DICOM specialist answers imaging questions with the [OpenAI Agents SDK](http
 ## Run it
 
 ```bash
-pixi run dicom                 # installs the sandbox env on first run, serves :8004
+pixi run dicom                 # installs the sandbox env on first run, serves :8005
 pixi run stack /path/to/case   # or start it with the rest of the stack
 ```
 
@@ -17,7 +17,7 @@ It is registered in `configs/agents.toml`:
 
 ```toml
 [dicom]
-url = "http://127.0.0.1:8004/v1"
+url = "http://127.0.0.1:8005/v1"
 description = "DICOM and radiology specialist. ..."
 ```
 

@@ -14,10 +14,13 @@ It prints an address such as `http://127.0.0.1:8002/v1`. `pixi run stack` starts
 [notes]
 url = "http://127.0.0.1:8002/v1"
 description = "Answers from clinical notes with verified quotes, dates, and conflicts. Use this for questions about the chart, history, labs in notes, and discrepancies between notes."
+modalities = ["note"]
 ```
 
-For notes alone, pass that address as `--agent-url`. When a router is `--agent-url`, the server offers `consult_notes`, calls this process at most once per question, and still checks the router's citations.
+For notes alone, pass that address as `--agent-url`. When a router is `--agent-url`, the server offers `consult_notes`. With `modalities = ["note"]`, the router reads notes through this specialist and cites what it returns by finding id, such as `notes.1`.
 
-The page shows the verified quotes and documented discrepancies on the badge, the hover card, and the source viewer. How the server copies those fields onto the router's reply is in [Connect an agent](../agents.md#clinical-notes-specialist).
+Beside its citations it returns `abstentions`, what the notes do not document, and `facts`, the ledger facts behind each cited claim. Context sent with a consult frames the question for its model. It is not cited.
+
+The page shows the verified quotes and documented discrepancies on the badge, the hover card, and the source viewer. How the server keeps those fields as findings is in [Connect an agent](../agents.md#findings).
 
 It reads `GEMINI_API_KEY`, or the Azure settings, from `.env`. Scanned-PDF OCR uses Gemini only.

@@ -9,7 +9,7 @@ version = "0.2.0"
 python = ">=3.13,<3.14"
 
 [pypi-dependencies]
-meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists", "dicom"] }
+meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists", "orchestrator", "dicom"] }
 
 [environments]
 default = ["style", "docs"]
@@ -21,7 +21,9 @@ dicom-sandbox = { features = ["dicom-sandbox"], no-default-feature = true }
 stack = { cmd = "python scripts/stack.py", description = "Start the router, specialists, and web server for one case" }
 serve = "python -m meddataos.server"
 agent = "python examples/agent.py"
+orchestrator = "python -m meddataos.orchestrator.serve"
 notes = "python -m meddataos.specialists.notes.serve"
+tabular = "python -m meddataos.specialists.tabular.serve"
 dicom = { cmd = "python -m meddataos.specialists.dicom.serve", depends-on = ["dicom-sandbox-install"], description = "Serve the DICOM specialist (OpenAI Agents SDK)" }
 dicom-sandbox-install = { cmd = "pixi install -e dicom-sandbox", description = "Install the DICOM sandbox Python environment" }
 test = "pytest tests"

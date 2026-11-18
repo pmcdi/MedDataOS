@@ -1,6 +1,6 @@
 """Serve the DICOM specialist at POST /v1/chat/completions.
 
-    python -m meddataos.specialists.dicom.serve --port 8004
+    python -m meddataos.specialists.dicom.serve --port 8005
 
 MedDataOS registers it as a specialist (configs/agents.toml). The specialist does
 not open the case itself: it asks MedDataOS for data through the tools MedDataOS
@@ -121,7 +121,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DICOM specialist (OpenAI Agents SDK)")
     parser.add_argument("--case", default=None, help="Case folder (logged only)")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8004)
+    parser.add_argument("--port", type=int, default=8005)
     args = parser.parse_args()
 
     if args.case:

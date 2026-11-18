@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -41,3 +42,63 @@ def get_case(patient_id: str) -> Case:
         if case is None:
             case = _CASES[patient_id] = Case.open(case_root(patient_id))
         return case
+
+
+# The lines the server adds below a consult's question. They match
+# CONTEXT_HEADING and RESOURCES_HEADING in meddataos.server.dispatch.
+CONTEXT_HEADING = "Context from other specialists:"
+RESOURCES_HEADING = "Use these resources:"
+REFUSAL_PREFIX = "The server refused"
+
+
+@dataclass
+class Request:
+    """One consult: the question, what other specialists found, and files to use."""
+
+    question: str
+    context: str = ""
+    resource_ids: list[str] = field(default_factory=list)
+
+
+def parse_request(text: str) -> Request:
+    """Split a consult message into its question, context, and resource ids."""
+    body = text.strip()
+    resource_ids: list[str] = []
+    marker = f"\n\n{RESOURCES_HEADING}"
+
+    if marker in body:
+        body, _, listed = body.rpartition(marker)
+        resource_ids = [part.strip() for part in listed.split(",") if part.strip()]
+
+    question, found, context = body.partition(f"\n\n{CONTEXT_HEADING}")
+    return Request(
+        question=question.strip(),
+        context=context.strip() if found else "",
+        resource_ids=resource_ids,
+    )
+
+
+def user_turns(messages: list) -> list[str]:
+    """The text of each user message, in order."""
+    return [
+        message["content"]
+        for message in messages
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+    ]
+
+
+def latest_request(messages: list) -> Request:
+    """The latest question, skipping a citation-correction turn.
+
+    The page sends the whole chat. A correction from the server is appended
+    after the question, so the question is the last user turn that is not one.
+    """
+    users = user_turns(messages)
+
+    for text in reversed(users):
+        if not text.startswith(REFUSAL_PREFIX):
+            return parse_request(text)
+
+    return parse_request(users[-1] if users else "")

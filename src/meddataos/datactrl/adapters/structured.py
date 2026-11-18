@@ -11,8 +11,14 @@ from pathlib import Path
 from typing import Any, cast
 
 from meddataos.datactrl.adapters.base import resolve_fetch_options
-from meddataos.datactrl.errors import ResourceNotFound
-from meddataos.datactrl.limits import DEFAULT_TABLE_LIMIT, MAX_TABLE_LIMIT
+from meddataos.datactrl.errors import InvalidFetchOptions, ResourceNotFound
+from meddataos.datactrl.limits import (
+    DEFAULT_TABLE_LIMIT,
+    MAX_SERIES_POINTS,
+    MAX_TABLE_ITEMS,
+    MAX_TABLE_LIMIT,
+    MAX_TYPED_ROWS,
+)
 from meddataos.datactrl.types import (
     DescribeResult,
     FetchResult,
@@ -21,6 +27,8 @@ from meddataos.datactrl.types import (
     ViewSpec,
     make_resource_id,
 )
+from meddataos.datactrl.utils import scores
+from meddataos.datactrl.utils.table import Table, filter_rows, series
 
 
 @dataclass
@@ -28,14 +36,41 @@ class _TableRecord:
     ref: ResourceRef
     path: Path
     format: str
+    # The typed table and the file time it was read at.
+    table: Table | None = None
+    read_at: float = 0.0
+    # True when the file has more rows than the typed views read.
+    partial: bool = False
 
 
 _VIEWS = (
     ViewSpec(
         name="rows",
-        description="Tabular rows with limit/offset/column projection",
+        description=(
+            "Rows with limit/offset and column projection. where filters rows "
+            "with {column, op, value} conditions (op: eq, ne, gt, ge, lt, le, "
+            "contains, in) and order_by sorts them (prefix - for descending). "
+            "row_numbers gives each returned row's position in the file."
+        ),
         defaults={"limit": DEFAULT_TABLE_LIMIT, "offset": 0},
         max={"limit": MAX_TABLE_LIMIT},
+    ),
+    ViewSpec(
+        name="series",
+        description=(
+            "One measurement over time in one unit, with first, last, lowest, "
+            "highest, and change. Pass item for a table with one row per test "
+            "(shape long), or column for a table with one row per visit (shape "
+            "wide). from_date and to_date bound the dates."
+        ),
+    ),
+    ViewSpec(
+        name="score",
+        description=(
+            "A clinical score computed from this table: name (see describe), "
+            "optional at date, and inputs for values the table does not hold. "
+            "An input that is missing is listed, not estimated."
+        ),
     ),
 )
 
@@ -75,11 +110,50 @@ class StructuredAdapter:
         return refs
 
     def describe(self, resource_id: str) -> DescribeResult:
-        """Return column names and row count for one table."""
+        """Return columns, their types and roles, and what can be asked of the table.
+
+        ``shape`` says how the table is laid out: ``long`` (one row per test per
+        draw), ``wide`` (one row per visit), ``events``, ``intervals`` (start and
+        stop dates), ``record`` (one row), or ``table``.
+        """
         record = self._require(resource_id)
-        columns, row_count = _schema_and_count(record.path, record.format)
-        if not columns:
-            columns = list(record.ref.meta.get("columns", []))
+        table = self._table(record)
+        columns = table.columns or list(record.ref.meta.get("columns", []))
+        row_count = len(table.rows)
+
+        if record.partial:
+            _, row_count = _schema_and_count(record.path, record.format)
+
+        summary: dict[str, Any] = {
+            "format": record.format,
+            "columns": columns,
+            "row_count": row_count,
+            "shape": table.shape,
+            "roles": dict(table.roles),
+            "column_types": table.types,
+        }
+
+        if table.shape == "long":
+            summary["items"] = table.items(MAX_TABLE_ITEMS)
+        elif table.shape == "wide":
+            summary["series_columns"] = table.measured_columns()
+
+        time_column = table.roles.get("time") or table.roles.get("start")
+
+        if time_column:
+            dated = table.types[time_column]
+            summary["date_range"] = [dated.get("min"), dated.get("max")]
+
+        if table.shape in ("long", "wide", "record"):
+            summary["scores"] = scores.available()
+
+        if record.partial:
+            summary["rows_read"] = len(table.rows)
+            summary["note"] = (
+                f"Only the first {len(table.rows)} rows are typed, filtered, and "
+                "read as series."
+            )
+
         return DescribeResult(
             id=resource_id,
             modality=Modality.STRUCTURED,
@@ -87,56 +161,140 @@ class StructuredAdapter:
             path=record.ref.path,
             views=[spec.name for spec in _VIEWS],
             view_specs=list(_VIEWS),
-            summary={
-                "format": record.format,
-                "columns": columns,
-                "row_count": row_count,
-            },
+            summary=summary,
         )
 
     def fetch(
         self, resource_id: str, view: str | None = None, **opts: Any
     ) -> FetchResult:
-        """Fetch bounded rows with optional column projection."""
+        """Fetch rows, one measurement over time, or a score."""
         resolved_view, merged = resolve_fetch_options(
             _VIEWS, view, opts, default_view="rows"
         )
         record = self._require(resource_id)
-        limit = int(merged.get("limit", DEFAULT_TABLE_LIMIT))
-        offset = int(merged.get("offset", 0))
-        columns = merged.get("columns")
+        table = self._table(record)
+        bounds: dict[str, Any] = {}
 
-        rows = _load_rows(record.path, record.format)
-        total = len(rows)
-        sliced = rows[offset : offset + limit]
-
-        if columns:
-            sliced = [{key: row.get(key) for key in columns} for row in sliced]
-
-        out_columns = columns or (
-            list(rows[0].keys()) if rows else list(record.ref.meta.get("columns", []))
-        )
+        if resolved_view == "series":
+            data = series(
+                table,
+                item=merged.get("item"),
+                column=merged.get("column"),
+                from_date=merged.get("from_date"),
+                to_date=merged.get("to_date"),
+            )
+            total = len(data["points"])
+            data["points"] = data["points"][-MAX_SERIES_POINTS:]
+            bounds = {"points": total, "truncated": total > MAX_SERIES_POINTS}
+        elif resolved_view == "score":
+            data = scores.compute(
+                table,
+                merged.get("name"),
+                at=merged.get("at"),
+                inputs=merged.get("inputs"),
+                window_days=merged.get("window_days"),
+            )
+        else:
+            data, bounds = self._rows(record, table, merged)
 
         return FetchResult(
             id=resource_id,
             modality=Modality.STRUCTURED,
             view=resolved_view,
-            data={
-                "columns": out_columns,
-                "rows": sliced,
-                "row_count": total,
-            },
-            bounds={
-                "limit": limit,
-                "offset": offset,
-                "truncated": offset + limit < total,
-            },
+            data=data,
+            bounds=bounds,
             provenance={
                 "path": record.ref.path,
                 "adapter": "structured",
                 "adapter_version": self.version,
             },
         )
+
+    def _rows(
+        self, record: _TableRecord, table: Table, merged: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """One page of rows, after any filter and sort."""
+        limit = int(merged.get("limit", DEFAULT_TABLE_LIMIT))
+        offset = int(merged.get("offset", 0))
+        columns = self._projection(table, merged.get("columns"))
+        found = filter_rows(table, merged.get("where"), merged.get("order_by"))
+        page = found[offset : offset + limit]
+        rows = [row for _, row in page]
+
+        if columns:
+            rows = [{key: row.get(key) for key in columns} for row in rows]
+
+        data: dict[str, Any] = {
+            "columns": columns
+            or table.columns
+            or list(record.ref.meta.get("columns", [])),
+            "rows": rows,
+            "row_count": len(table.rows),
+            "row_numbers": [index for index, _ in page],
+        }
+
+        if record.partial:
+            data["rows_read"] = len(table.rows)
+
+        if merged.get("where"):
+            data["matched"] = len(found)
+
+        bounds = {
+            "limit": limit,
+            "offset": offset,
+            "truncated": offset + limit < len(found),
+        }
+        return data, bounds
+
+    @staticmethod
+    def _projection(table: Table, wanted: Any) -> list[str] | None:
+        """The table's own names for the columns asked for.
+
+        Raises:
+            InvalidFetchOptions: When a column is not in the table. A column of
+                nulls would read as "not recorded" when the name was only wrong.
+        """
+        if not wanted:
+            return None
+
+        names = (
+            [str(item) for item in wanted]
+            if isinstance(wanted, list)
+            else [str(wanted)]
+        )
+        found = [table.column(name) for name in names]
+        missing = [
+            name for name, column in zip(names, found, strict=True) if not column
+        ]
+
+        if missing:
+            raise InvalidFetchOptions(
+                f"Unknown column {', '.join(repr(name) for name in missing)}; "
+                f"columns: {', '.join(table.columns)}"
+            )
+
+        return [column for column in found if column]
+
+    def _table(self, record: _TableRecord) -> Table:
+        """The typed table, read again when the file has changed."""
+        try:
+            modified = record.path.stat().st_mtime
+        except OSError:
+            modified = 0.0
+
+        if record.table is None or modified != record.read_at:
+            rows = _load_rows(record.path, record.format, max_rows=MAX_TYPED_ROWS + 1)
+            record.partial = len(rows) > MAX_TYPED_ROWS
+            rows = rows[:MAX_TYPED_ROWS]
+            columns = (
+                list(rows[0].keys())
+                if rows
+                else _sample_columns(record.path, record.format)
+            )
+            record.table = Table.build(columns, rows)
+            record.read_at = modified
+
+        return record.table
 
     def _require(self, resource_id: str) -> _TableRecord:
         """Look up an indexed table or raise ResourceNotFound."""

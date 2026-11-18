@@ -161,13 +161,16 @@ class AppState:
         self.reviews: dict[str, dict] = {}
         self.agent_url: str | None = None
         self.specialists: dict = {}
-        self.consulted: dict[str, dict[str, dict]] = {}
+        # Per open question, by session id. Dropped when the answer is delivered.
+        self.consults: dict[str, dict] = {}
+        self.findings: dict[str, dict] = {}
         self.pending: set[str] = set()
         self.reads: dict[str, list[dict]] = {}
         self.calls: dict[str, dict[str, dict]] = {}
-        self.cited: dict[str, dict[str, dict]] = {}
         self.runs: dict[str, dict] = {}
         self.datactrl_case: Case | None = None
+        # Built on first request. The case folder does not change while it is open.
+        self.timeline: dict | None = None
         self.hub = Hub()
 
     def open(self, folder: str) -> Path:

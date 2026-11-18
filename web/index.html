@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MedDataOS - Medical Data Operating System</title>
-    <link rel="stylesheet" href="/static/style.css?v=76">
+    <link rel="stylesheet" href="/static/style.css?v=77">
 </head>
 <body>
     <div class="container">
@@ -59,6 +59,9 @@
                             <button id="clear-btn" class="btn-clear">Clear</button>
                         </div>
                     </div>
+
+                    <!-- Dated notes, studies, and table rows of the case, in lanes -->
+                    <div class="timeline-strip" id="timeline-strip" hidden></div>
 
                     <div class="chat-container" id="chat-container">
                         <!-- Chat messages will be added here dynamically -->
@@ -135,6 +138,7 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
 
-    <script src="/static/app.js?v=87"></script>
+    <script src="/static/evidence.js?v=1"></script>
+    <script src="/static/app.js?v=88"></script>
 </body>
 </html>
