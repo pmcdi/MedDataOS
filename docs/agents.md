@@ -72,9 +72,9 @@ A markdown fence around that JSON is removed. Any other shape, invalid JSON, or 
 url = "http://127.0.0.1:8002/v1"
 description = "Answers from clinical notes with verified quotes, dates, and conflicts."
 
-[imaging]
-url = "http://127.0.0.1:8003/v1"
-description = "Looks at one DICOM slice. Use this for questions about the images, scans, contours, or what is visible on imaging."
+[dicom]
+url = "http://127.0.0.1:8004/v1"
+description = "DICOM and radiology specialist. ..."
 ```
 
 ```bash
@@ -83,7 +83,7 @@ pixi run serve /path/to/folder --agent-url http://127.0.0.1:8001/v1 --agents con
 
 `--specialist notes=http://127.0.0.1:8002/v1` does the same for one agent, and can be repeated. A name is a short lowercase word. The same name cannot be listed twice.
 
-The router is given one extra tool per specialist, `consult_notes`, `consult_imaging`, and so on. The description is the only routing hint. The server runs that call: it posts the question and the datactrl tools to the specialist, and does not give the specialist a `consult_` tool, so agents cannot call each other. Each specialist is called at most once per question; a second call returns the first result. A timeout, an HTTP error, or citations that still fail after six corrections become a tool error. The router can still answer from the specialists that succeeded.
+The router is given one extra tool per specialist, `consult_notes`, `consult_dicom`, and so on. The description is the only routing hint. The server runs that call: it posts the question and the datactrl tools to the specialist, and does not give the specialist a `consult_` tool, so agents cannot call each other. Each specialist is called at most once per question; a second call returns the first result. A timeout, an HTTP error, or citations that still fail after six corrections become a tool error. The router can still answer from the specialists that succeeded.
 
 A specialist may answer in plain text, or with the citation JSON below. A `describe` or `fetch` it calls comes back with a `cite` token, and that token is what the citation names. A specialist that reads the case itself, without those tools, cites the file's `web_path` instead. Files it cites count as opened, so the router's own reply has to cite them too. With no specialists registered, none of this is added and the server talks only to `--agent-url`.
 
@@ -101,21 +101,13 @@ description = "Answers from clinical notes with verified quotes, dates, and conf
 
 It opens that case itself and returns citation JSON. Each citation is tagged `clinical_notes` and carries the verified quotes and documented discrepancies, which the page shows on the badge, the hover card, and the source viewer. It does not ask the server to read files.
 
-## Imaging specialist (stand-in)
+## DICOM specialist
 
-A temporary imaging specialist, `pixi run imaging --case /path/to/case` from the root of this repo, stands in until a fuller imaging agent exists. Both specialists read `GEMINI_API_KEY` from this repo's `.env`. It prints `http://127.0.0.1:8003/v1`. Register it next to notes:
-
-```toml
-[imaging]
-url = "http://127.0.0.1:8003/v1"
-description = "Looks at one DICOM slice. Use this for questions about the images, scans, contours, or what is visible on imaging."
-```
-
-It ranks the case's series against the question, renders one preview slice (with contours for an RTSTRUCT or when the question asks for them), and describes that slice with a vision model (Gemini). A confident pick becomes one citation for the series file, tagged `imaging`, with a `preview` of the slice index, window, and overlay; the page loads that slice from `/api/dicom/preview`. If no series ranks confidently, the reply is plain text listing the candidates and has no citation. Any agent can take its place as long as it answers the same way.
+The DICOM specialist is `pixi run dicom`. It is built on the OpenAI Agents SDK and reads the case only through the datactrl tools the server sends. It can also search allowlisted radiology reference sites and run Python in a sandbox on fetched volumes. See [DICOM specialist](specialists/dicom.md).
 
 ## Azure OpenAI
 
-The example router speaks Azure when these are set in this repo's `.env`. The notes and imaging specialists read the same variables from the same file:
+The example router speaks Azure when these are set in this repo's `.env`. The notes and DICOM specialists read the same variables from the same file:
 
 ```bash
 AZURE_OPENAI_API_KEY=

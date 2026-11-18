@@ -31,6 +31,16 @@ specialists = [
     "python-dateutil>=2.9",
     "python-dotenv>=1.0.0,<2",
 ]
+dicom = [
+    "meddataos[datactrl]",
+    "openai-agents>=0.24,<0.25",
+    "openai>=3,<4",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "fastapi>=0.104.0,<1",
+    "uvicorn[standard]>=0.24.0,<1",
+    "python-dotenv>=1.0.0,<2",
+]
 
 [build-system]
 build-backend = "hatchling.build"

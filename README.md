@@ -22,7 +22,7 @@ Copy `.env.example` to `.env`.
 
 To use the example agent, set `OPENAI_MODEL`. Set `OPENAI_API_KEY` when the model requires one. `OPENAI_BASE_URL` is the model's base URL, the part before `/chat/completions`. The example agent calls `https://api.openai.com/v1` only when `OPENAI_BASE_URL` is unset. A blank value does not use that default, so set the URL or remove the line.
 
-To run everything for one case, the example agent, the notes and imaging specialists from `configs/agents.toml`, and the server:
+To run everything for one case, the example agent, the notes and DICOM specialists from `configs/agents.toml`, and the server:
 
 ```bash
 pixi run stack data/TCGA-DD-A4NF
@@ -89,7 +89,7 @@ If the agent opens no files, it answers in plain text. If it still can't cite co
 
 A successful `describe` or `fetch` of a file in the case list counts as opening it. The answer then has to be the citation JSON in [Connect an agent](docs/agents.md). With no file opened, plain text is accepted, and a JSON object is sent back with a request for plain text.
 
-With no extra flags, the page talks only to `--agent-url`. Optional specialists are other chat endpoints, registered with `--agents` or repeated `--specialist name=url` flags. The server offers each one to the router as `consult_<name>`, runs that call, and still checks citations. Notes and imaging are started as their own processes and registered that way. [Connect an agent](docs/agents.md) describes both.
+With no extra flags, the page talks only to `--agent-url`. Optional specialists are other chat endpoints, registered with `--agents` or repeated `--specialist name=url` flags. The server offers each one to the router as `consult_<name>`, runs that call, and still checks citations. Notes and DICOM are started as their own processes and registered that way. [Connect an agent](docs/agents.md) describes both.
 
 The example agent forwards to `OPENAI_MODEL`, or to Azure OpenAI when `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, and `AZURE_OPENAI_DEPLOYMENT` are set.
 

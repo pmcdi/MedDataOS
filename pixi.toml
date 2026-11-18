@@ -9,18 +9,21 @@ version = "0.2.0"
 python = ">=3.13,<3.14"
 
 [pypi-dependencies]
-meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists"] }
+meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists", "dicom"] }
 
 [environments]
 default = ["style", "docs"]
 library = { features = ["library"], no-default-feature = true }
+# The Python the DICOM specialist's sandbox runs. Kept apart from the server env.
+dicom-sandbox = { features = ["dicom-sandbox"], no-default-feature = true }
 
 [tasks]
 stack = { cmd = "python scripts/stack.py", description = "Start the router, specialists, and web server for one case" }
 serve = "python -m meddataos.server"
 agent = "python examples/agent.py"
 notes = "python -m meddataos.specialists.notes.serve"
-imaging = "python -m meddataos.specialists.imaging.serve"
+dicom = { cmd = "python -m meddataos.specialists.dicom.serve", depends-on = ["dicom-sandbox-install"], description = "Serve the DICOM specialist (OpenAI Agents SDK)" }
+dicom-sandbox-install = { cmd = "pixi install -e dicom-sandbox", description = "Install the DICOM sandbox Python environment" }
 test = "pytest tests"
 
 ############################################## STYLE ###############################################
@@ -54,3 +57,17 @@ python = ">=3.13,<3.14"
 
 [feature.library.pypi-dependencies]
 meddataos = { path = ".", editable = true, extras = ["datactrl"] }
+
+############################################ DICOM SANDBOX #########################################
+# Packages the DICOM specialist can use in its sandbox shell. Add model runtimes here later.
+
+[feature.dicom-sandbox.dependencies]
+python = ">=3.13,<3.14"
+numpy = "*"
+scipy = "*"
+simpleitk = "*"
+nibabel = "*"
+pydicom = "*"
+scikit-image = "*"
+pandas = "*"
+matplotlib-base = "*"
