@@ -24,7 +24,13 @@ from fastapi.responses import JSONResponse
 
 from meddataos.specialists.dicom import agent, sandbox, translate
 
-PATIENT_CARD = "Fill in the patient card."
+# MedDataOS sends this at startup to the --agent-url agent. If this specialist is
+# run that way it has no patient card to give, so it answers with an empty one
+# instead of running the agent.
+PATIENT_CARD_QUESTION = "Fill in the patient card."
+
+# MedDataOS starts its correction turns with this; they are not the question.
+CORRECTION_PREFIX = "The server refused"
 
 app = FastAPI(title="MedDataOS DICOM specialist")
 
@@ -34,13 +40,18 @@ def log(message: str) -> None:
 
 
 def latest_question(messages: list[dict[str, Any]]) -> str:
-    users = [
-        translate.text_of(m.get("content")) for m in messages if m.get("role") == "user"
+    """The most recent user message that is a question, not a correction."""
+    user_texts = [
+        translate.text_of(message.get("content"))
+        for message in messages
+        if message.get("role") == "user"
     ]
-    for text in reversed(users):
-        if not text.startswith("The server refused"):
+
+    for text in reversed(user_texts):
+        if not text.startswith(CORRECTION_PREFIX):
             return text.strip()
-    return (users[-1] if users else "").strip()
+
+    return (user_texts[-1] if user_texts else "").strip()
 
 
 @app.get("/health")
@@ -66,8 +77,8 @@ async def chat_completions(request: Request) -> JSONResponse:
     model = body.get("model") or "dicom-specialist"
     question = latest_question(messages)
 
-    if question == PATIENT_CARD:
-        card = {
+    if question == PATIENT_CARD_QUESTION:
+        empty_card = {
             "name": "",
             "age": "",
             "sex": "",
@@ -76,28 +87,33 @@ async def chat_completions(request: Request) -> JSONResponse:
             "conditions": [],
             "data_dates": {},
         }
-        return JSONResponse(translate.completion(model, json.dumps(card)))
+        return JSONResponse(translate.completion(model, json.dumps(empty_card)))
 
-    key = translate.conversation_key(messages)
-    tool_rounds = sum(1 for m in messages if m.get("role") == "tool")
-    log(f"consult={key[:8]} tool_results={tool_rounds} question: {question[:160]}")
+    consult_label = translate.conversation_key(messages)[:8]
+    tool_result_count = sum(1 for message in messages if message.get("role") == "tool")
+    log(
+        f"consult={consult_label} tool_results={tool_result_count} "
+        f"question: {question[:160]}"
+    )
     sandbox.remove_idle_workspaces()
 
+    # Any failure is returned as the answer text, so MedDataOS shows it in the
+    # chat instead of the consult hanging until its timeout.
     try:
         reply = await agent.respond(messages, tools)
-    except Exception as exc:  # noqa: BLE001 - report the failure as the answer
+    except Exception as error:  # noqa: BLE001
         traceback.print_exc()
-        log(f"consult={key[:8]} failed: {exc}")
+        log(f"consult={consult_label} failed: {error}")
         return JSONResponse(
-            translate.completion(model, f"The DICOM specialist failed: {exc}")
+            translate.completion(model, f"The DICOM specialist failed: {error}")
         )
 
     if reply.tool_calls:
-        names = ", ".join(c["function"]["name"] for c in reply.tool_calls)
-        log(f"consult={key[:8]} -> MedDataOS tools: {names}")
+        tool_names = ", ".join(call["function"]["name"] for call in reply.tool_calls)
+        log(f"consult={consult_label} -> MedDataOS tools: {tool_names}")
         return JSONResponse(translate.completion(model, None, reply.tool_calls))
 
-    log(f"consult={key[:8]} answer chars={len(reply.content or '')}")
+    log(f"consult={consult_label} answer chars={len(reply.content or '')}")
     return JSONResponse(translate.completion(model, reply.content or ""))
 
 
@@ -112,6 +128,7 @@ def main() -> None:
         log(f"case: {args.case} (data comes through MedDataOS tools)")
     log(f"model: {agent.model_name() or '<unset>'}  sandbox: {sandbox.SANDBOX_ENV}")
     log(f"agent: http://{args.host}:{args.port}/v1")
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

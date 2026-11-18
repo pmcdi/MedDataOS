@@ -35,9 +35,10 @@ SANDBOX_ENV = Path(
 IDLE_SECONDS = 2 * 3600
 WORKSPACE_DIRS = ("volumes", "previews", "documents", "scripts", "out")
 
-# Environment variables that must not reach sandboxed commands.
-_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
-_SECRET_PREFIXES = (
+# The local client copies this process's environment into every command, which
+# includes the model API keys. Any variable that looks like a secret is blanked.
+SECRET_NAME_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+SECRET_NAME_PREFIXES = (
     "AZURE_",
     "OPENAI_",
     "GEMINI_",
@@ -60,6 +61,7 @@ class ImageViewer(Capability):
     def tools(self) -> list[Tool]:
         if self.session is None:
             raise ValueError("ImageViewer capability is not bound to a SandboxSession")
+
         return [ViewImageTool(session=self.session, user=self.run_as)]
 
 
@@ -69,45 +71,55 @@ def capabilities() -> list[Capability]:
 
 def workspace_for(key: str) -> Path:
     """The workspace folder for one consult, created on first use."""
-    path = WORKSPACES / key
-    for name in WORKSPACE_DIRS:
-        (path / name).mkdir(parents=True, exist_ok=True)
-    os.utime(path)
-    return path
+    workspace = WORKSPACES / key
+    for folder_name in WORKSPACE_DIRS:
+        (workspace / folder_name).mkdir(parents=True, exist_ok=True)
+
+    # Touch the folder on every request: remove_idle_workspaces goes by mtime.
+    os.utime(workspace)
+    return workspace
 
 
 def sandbox_environment() -> dict[str, str]:
     """Variables set for sandboxed commands: sandbox Python first, secrets blanked."""
-    env: dict[str, str] = {
+    environment: dict[str, str] = {
+        # The sandbox env comes first, so `python` is the one with SimpleITK and
+        # friends, not the server's Python.
         "PATH": os.pathsep.join(
             [str(SANDBOX_ENV / "bin"), "/usr/local/bin", "/usr/bin", "/bin"]
         ),
-        "MPLBACKEND": "Agg",
-        "PYTHONNOUSERSITE": "1",
+        "MPLBACKEND": "Agg",  # no display; figures are saved as files
+        "PYTHONNOUSERSITE": "1",  # ignore packages in the user's ~/.local
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    for name in os.environ:
-        upper = name.upper()
-        if upper.startswith(_SECRET_PREFIXES) or any(
-            m in upper for m in _SECRET_MARKERS
-        ):
-            env[name] = ""
-    return env
+
+    for variable_name in os.environ:
+        upper_name = variable_name.upper()
+        looks_secret = upper_name.startswith(SECRET_NAME_PREFIXES) or any(
+            marker in upper_name for marker in SECRET_NAME_MARKERS
+        )
+        if looks_secret:
+            environment[variable_name] = ""
+
+    return environment
 
 
 def run_config(key: str) -> SandboxRunConfig:
     """Sandbox settings for one run of the agent on consult ``key``."""
-    workspace = workspace_for(key)
+    # A manifest root other than the SDK default makes the local client use that
+    # folder as-is and keep it after the run, which is what lets files persist
+    # across the POSTs of one consult.
     manifest = Manifest(
-        root=str(workspace),
+        root=str(workspace_for(key)),
         environment=Environment(value=sandbox_environment()),  # type: ignore[arg-type]
     )
     return SandboxRunConfig(client=_client(), manifest=manifest)
 
 
 def _client():  # type: ignore[no-untyped-def]
-    kind = os.getenv("DICOM_SANDBOX", "local").strip().lower()
-    if kind == "local":
+    sandbox_kind = os.getenv("DICOM_SANDBOX", "local").strip().lower()
+
+    if sandbox_kind == "local":
         from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 
         if not (SANDBOX_ENV / "bin" / "python").exists():
@@ -115,21 +127,27 @@ def _client():  # type: ignore[no-untyped-def]
                 f"No sandbox Python at {SANDBOX_ENV}. Run: pixi install -e dicom-sandbox"
             )
         return UnixLocalSandboxClient()
-    if kind == "docker":
+
+    if sandbox_kind == "docker":
         raise NotImplementedError(
             "DICOM_SANDBOX=docker is not set up yet; use DICOM_SANDBOX=local."
         )
-    raise ValueError(f"Unknown DICOM_SANDBOX={kind!r}; expected local or docker")
+
+    raise ValueError(
+        f"Unknown DICOM_SANDBOX={sandbox_kind!r}; expected local or docker"
+    )
 
 
 def remove_idle_workspaces(max_idle: float = IDLE_SECONDS) -> int:
     """Delete workspaces untouched for ``max_idle`` seconds. Returns how many."""
     if not WORKSPACES.exists():
         return 0
-    removed = 0
+
+    removed_count = 0
     cutoff = time.time() - max_idle
-    for path in WORKSPACES.iterdir():
-        if path.is_dir() and path.stat().st_mtime < cutoff:
-            shutil.rmtree(path, ignore_errors=True)
-            removed += 1
-    return removed
+    for workspace in WORKSPACES.iterdir():
+        if workspace.is_dir() and workspace.stat().st_mtime < cutoff:
+            shutil.rmtree(workspace, ignore_errors=True)
+            removed_count += 1
+
+    return removed_count

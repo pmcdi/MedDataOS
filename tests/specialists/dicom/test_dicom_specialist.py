@@ -68,7 +68,7 @@ def test_to_input_items_keeps_parallel_tool_calls_in_order() -> None:
     ]
     items = translate.to_input_items(messages)
 
-    assert [i.get("type") or i["role"] for i in items] == [
+    assert [item.get("type") or item["role"] for item in items] == [
         "user",
         "function_call",
         "function_call",
@@ -207,7 +207,7 @@ def test_meddataos_tool_call_is_handed_back(
     reply = asyncio.run(agent.respond(messages, [FETCH_TOOL]))
 
     assert reply.content is None
-    assert [c["id"] for c in reply.tool_calls] == ["c1", "c2"]
+    assert [call["id"] for call in reply.tool_calls] == ["c1", "c2"]
     assert json.loads(reply.tool_calls[1]["function"]["arguments"]) == {
         "resource_id": "dicom:2"
     }
@@ -238,9 +238,11 @@ def test_sandbox_measures_a_volume_and_keeps_the_workspace(
         },
     }
     script = (
-        'python -c "import SimpleITK as s, numpy as n; '
-        "i=s.ReadImage('volumes/v1.nii.gz'); a=s.GetArrayFromImage(i); "
-        'print(int((a==1).sum())*n.prod(i.GetSpacing())/1000)" | tee out/volume.txt'
+        'python -c "import SimpleITK as sitk, numpy as np; '
+        "image=sitk.ReadImage('volumes/v1.nii.gz'); "
+        "mask=sitk.GetArrayFromImage(image); "
+        'print(int((mask==1).sum())*np.prod(image.GetSpacing())/1000)" '
+        "| tee out/volume.txt"
     )
     model = ScriptedModel(
         [

@@ -37,10 +37,14 @@ from meddataos.specialists.dicom import sandbox, translate, volumes
 from meddataos.specialists.dicom.prompt import PREAMBLE
 from meddataos.specialists.dicom.references import References
 
+# Tracing would upload run data, including case content, to OpenAI.
 set_tracing_disabled(True)
 
 MAX_TURNS = int(os.getenv("DICOM_MAX_TURNS", "24"))
-_PLACEHOLDER = "Sent to MedDataOS. Its result arrives with the next message."
+
+# What the model sees as the result of a MedDataOS tool call within this run.
+# The run stops right after, so this text only ends up in the run's own history.
+REMOTE_CALL_PLACEHOLDER = "Sent to MedDataOS. Its result arrives with the next message."
 
 
 @dataclass
@@ -83,40 +87,45 @@ def build_model() -> Model:
     from agents import OpenAIChatCompletionsModel, OpenAIResponsesModel
     from openai import AsyncAzureOpenAI, AsyncOpenAI
 
-    api = os.getenv("DICOM_API", "chat").strip().lower()
-    name = model_name()
-    if not name:
+    api_style = os.getenv("DICOM_API", "chat").strip().lower()
+    deployment = model_name()
+    if not deployment:
         raise RuntimeError("Set DICOM_AZURE_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT.")
 
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-    key = os.getenv("AZURE_OPENAI_API_KEY", "")
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    azure_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+
     client: AsyncOpenAI
-    if endpoint and key:
-        if api == "responses":
-            client = AsyncOpenAI(base_url=f"{endpoint}/openai/v1/", api_key=key)
+    if azure_endpoint and azure_key:
+        if api_style == "responses":
+            # Azure's v1 endpoint speaks the plain OpenAI API, Responses included.
+            client = AsyncOpenAI(
+                base_url=f"{azure_endpoint}/openai/v1/", api_key=azure_key
+            )
         else:
             client = AsyncAzureOpenAI(
-                azure_endpoint=endpoint,
-                api_key=key,
+                azure_endpoint=azure_endpoint,
+                api_key=azure_key,
                 api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
             )
     else:
         client = AsyncOpenAI(base_url=os.getenv("OPENAI_BASE_URL") or None)
 
-    if api == "responses":
-        return OpenAIResponsesModel(model=name, openai_client=client)
-    return OpenAIChatCompletionsModel(model=name, openai_client=client)
+    if api_style == "responses":
+        return OpenAIResponsesModel(model=deployment, openai_client=client)
+    return OpenAIChatCompletionsModel(model=deployment, openai_client=client)
 
 
 def model_settings() -> ModelSettings:
-    effort = os.getenv("DICOM_REASONING_EFFORT") or os.getenv(
+    reasoning_effort = os.getenv("DICOM_REASONING_EFFORT") or os.getenv(
         "AZURE_OPENAI_REASONING_EFFORT"
     )
-    if effort:
-        from openai.types.shared import Reasoning
+    if not reasoning_effort:
+        return ModelSettings()
 
-        return ModelSettings(reasoning=Reasoning(effort=effort))  # type: ignore[typeddict-item]
-    return ModelSettings()
+    from openai.types.shared import Reasoning
+
+    return ModelSettings(reasoning=Reasoning(effort=reasoning_effort))  # type: ignore[typeddict-item]
 
 
 # ----------------------------------------------------------------------
@@ -127,55 +136,66 @@ def model_settings() -> ModelSettings:
 def remote_tool(spec: dict[str, Any]) -> FunctionTool:
     """A MedDataOS tool. Calling it records the call; MedDataOS runs it later."""
     function = spec.get("function") or spec
-    name = function["name"]
+    tool_name = function["name"]
 
-    async def invoke(ctx: ToolContext[TurnState], arguments: str) -> str:
-        ctx.context.remote_calls.append(
-            translate.tool_call(ctx.tool_call_id, name, arguments)
+    async def record_call(tool_context: ToolContext[TurnState], arguments: str) -> str:
+        tool_context.context.remote_calls.append(
+            translate.tool_call(tool_context.tool_call_id, tool_name, arguments)
         )
-        return _PLACEHOLDER
+        return REMOTE_CALL_PLACEHOLDER
 
     return FunctionTool(
-        name=name,
+        name=tool_name,
         description=function.get("description", ""),
         params_json_schema=function.get("parameters")
         or {"type": "object", "properties": {}},
-        on_invoke_tool=invoke,
+        on_invoke_tool=record_call,
+        # MedDataOS writes its schemas with optional fields, which strict mode
+        # rejects; the server validates the arguments itself.
         strict_json_schema=False,
     )
 
 
 def stop_on_remote(
-    ctx: RunContextWrapper[TurnState], results: list[FunctionToolResult]
+    run_context: RunContextWrapper[TurnState], results: list[FunctionToolResult]
 ) -> ToolsToFinalOutputResult:
-    """End the run as soon as the model called a MedDataOS tool."""
-    if ctx.context.remote_calls:
+    """End the run as soon as the model called a MedDataOS tool.
+
+    Local tools (sandbox, references) let the run continue. A MedDataOS call has
+    no result yet, so the run has to stop and hand the call back.
+    """
+    if run_context.context.remote_calls:
         return ToolsToFinalOutputResult(is_final_output=True, final_output="")
     return ToolsToFinalOutputResult(is_final_output=False)
 
 
 @lru_cache(maxsize=1)
 def references() -> References:
+    # One shared instance keeps the site index in memory between requests.
     return References()
 
 
 def reference_tools() -> list[FunctionTool]:
-    refs = references()
-    sites = ", ".join(f"{s.name} ({s.base_url})" for s in refs.sites) or "none"
+    reference_library = references()
+    site_list = (
+        ", ".join(f"{site.name} ({site.base_url})" for site in reference_library.sites)
+        or "none"
+    )
 
     @function_tool(
         name_override="reference_search",
         description_override=(
             "Search allowlisted radiology reference sites for background on anatomy, "
             "classification and staging systems, imaging findings and differentials. "
-            f"Sites: {sites}. Use general medical terms, never patient details. "
+            f"Sites: {site_list}. Use general medical terms, never patient details. "
             "Returns page titles and URLs; read one with reference_read."
         ),
     )
     async def reference_search(
         query: str, site: str | None = None, limit: int = 5
     ) -> str:
-        result = await asyncio.to_thread(refs.search, query, site, limit)
+        # The search and the page fetches block, so they run off the event loop.
+        result = await asyncio.to_thread(reference_library.search, query, site, limit)
         return json.dumps(result, ensure_ascii=False)
 
     @function_tool(
@@ -189,7 +209,9 @@ def reference_tools() -> list[FunctionTool]:
     async def reference_read(
         url: str, section: str | None = None, max_chars: int = 8000
     ) -> str:
-        result = await asyncio.to_thread(refs.read, url, section, max_chars)
+        result = await asyncio.to_thread(
+            reference_library.read, url, section, max_chars
+        )
         return json.dumps(result, ensure_ascii=False)
 
     return [reference_search, reference_read]
@@ -203,33 +225,37 @@ def reference_tools() -> list[FunctionTool]:
 class LogTools(RunHooks[TurnState]):
     """Print each local tool call, so sandbox and reference work shows in the log."""
 
-    def __init__(self, label: str) -> None:
-        self.label = label
+    def __init__(self, consult_label: str) -> None:
+        self.consult_label = consult_label
 
     async def on_tool_start(
         self, context: RunContextWrapper[TurnState], agent: Agent[TurnState], tool: Tool
     ) -> None:
         arguments = getattr(context, "tool_arguments", "") or ""
         print(
-            f"dicom  consult={self.label} tool {tool.name} {arguments[:300]}",
+            f"dicom  consult={self.consult_label} tool {tool.name} {arguments[:300]}",
             flush=True,
         )
 
 
 def build_agent(system: str, tools: list[dict[str, Any]]) -> Agent[TurnState]:
-    local = reference_tools()
-    local_names = {tool.name for tool in local}
-    remote = [
+    local_tools = reference_tools()
+    local_tool_names = {tool.name for tool in local_tools}
+
+    # Skip a MedDataOS tool whose name clashes with a local one; the SDK
+    # requires unique tool names.
+    remote_tools = [
         remote_tool(spec)
         for spec in tools
-        if (spec.get("function") or spec).get("name") not in local_names
+        if (spec.get("function") or spec).get("name") not in local_tool_names
     ]
+
     return SandboxAgent[TurnState](
         name="DICOM specialist",
         instructions=PREAMBLE + "\n" + system,
         model=build_model(),
         model_settings=model_settings(),
-        tools=[*remote, *local],
+        tools=[*remote_tools, *local_tools],
         tool_use_behavior=stop_on_remote,
         capabilities=sandbox.capabilities(),
     )
@@ -237,23 +263,26 @@ def build_agent(system: str, tools: list[dict[str, Any]]) -> Agent[TurnState]:
 
 async def respond(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Reply:
     """Run the agent on one MedDataOS request."""
-    key = translate.conversation_key(messages)
-    workspace = sandbox.workspace_for(key)
+    consult_key = translate.conversation_key(messages)
+    workspace = sandbox.workspace_for(consult_key)
     messages = volumes.externalize(messages, workspace)
 
     agent = build_agent(translate.system_prompt(messages), tools)
-    state = TurnState()
+    turn_state = TurnState()
     result = await Runner.run(
         agent,
         translate.to_input_items(messages),  # type: ignore[arg-type]
-        context=state,
+        context=turn_state,
         max_turns=MAX_TURNS,
-        hooks=LogTools(key[:8]),
-        run_config=RunConfig(sandbox=sandbox.run_config(key), tracing_disabled=True),
+        hooks=LogTools(consult_key[:8]),
+        run_config=RunConfig(
+            sandbox=sandbox.run_config(consult_key), tracing_disabled=True
+        ),
     )
-    if state.remote_calls:
-        return Reply(content=None, tool_calls=state.remote_calls)
-    output = result.final_output
-    return Reply(
-        content=output if isinstance(output, str) else str(output or ""), tool_calls=[]
-    )
+
+    if turn_state.remote_calls:
+        return Reply(content=None, tool_calls=turn_state.remote_calls)
+
+    final_output = result.final_output
+    answer = final_output if isinstance(final_output, str) else str(final_output or "")
+    return Reply(content=answer, tool_calls=[])

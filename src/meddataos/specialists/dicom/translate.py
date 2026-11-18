@@ -13,6 +13,8 @@ import time
 import uuid
 from typing import Any
 
+SYSTEM_ROLES = ("system", "developer")
+
 
 def text_of(content: Any) -> str:
     """Plain text from a string or a list of content parts."""
@@ -20,14 +22,16 @@ def text_of(content: Any) -> str:
         return ""
     if isinstance(content, str):
         return content
+
     if isinstance(content, list):
-        parts = []
+        text_parts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
-                parts.append(str(part.get("text") or ""))
+                text_parts.append(str(part.get("text") or ""))
             elif isinstance(part, str):
-                parts.append(part)
-        return "\n".join(parts)
+                text_parts.append(part)
+        return "\n".join(text_parts)
+
     return str(content)
 
 
@@ -36,35 +40,50 @@ def system_prompt(messages: list[dict]) -> str:
     return "\n\n".join(
         text_of(message.get("content"))
         for message in messages
-        if message.get("role") in ("system", "developer")
+        if message.get("role") in SYSTEM_ROLES
     )
 
 
 def conversation_key(messages: list[dict]) -> str:
-    """A stable id for one consult: the system prompt plus the first user message."""
-    first_user = next(
-        (text_of(m.get("content")) for m in messages if m.get("role") == "user"), ""
+    """A stable id for one consult: the system prompt plus the first user message.
+
+    MedDataOS sends no session id. These two messages are the same on every POST
+    of one consult and differ between consults, so they pick the workspace.
+    """
+    first_user_text = next(
+        (
+            text_of(message.get("content"))
+            for message in messages
+            if message.get("role") == "user"
+        ),
+        "",
     )
+
     digest = hashlib.sha256()
     digest.update(system_prompt(messages).encode())
-    digest.update(b"\0")
-    digest.update(first_user.encode())
+    digest.update(b"\0")  # separator, so "ab" + "c" and "a" + "bc" hash differently
+    digest.update(first_user_text.encode())
     return digest.hexdigest()[:24]
 
 
 def to_input_items(messages: list[dict]) -> list[dict[str, Any]]:
     """Chat messages (without system) as Agents SDK input items."""
     items: list[dict[str, Any]] = []
+
     for message in messages:
         role = message.get("role")
-        if role in ("system", "developer"):
-            continue
+
+        if role in SYSTEM_ROLES:
+            continue  # sent as the agent's instructions instead
+
         if role == "user":
             items.append({"role": "user", "content": text_of(message.get("content"))})
+
         elif role == "assistant":
             text = text_of(message.get("content"))
             if text:
                 items.append({"role": "assistant", "content": text})
+
             for call in message.get("tool_calls") or []:
                 function = call.get("function") or {}
                 items.append(
@@ -75,6 +94,7 @@ def to_input_items(messages: list[dict]) -> list[dict[str, Any]]:
                         "arguments": function.get("arguments") or "{}",
                     }
                 )
+
         elif role == "tool":
             items.append(
                 {
@@ -83,6 +103,7 @@ def to_input_items(messages: list[dict]) -> list[dict[str, Any]]:
                     "output": text_of(message.get("content")),
                 }
             )
+
     return items
 
 
@@ -93,6 +114,7 @@ def completion(
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
+
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -110,10 +132,13 @@ def completion(
 
 def tool_call(call_id: str, name: str, arguments: str) -> dict[str, Any]:
     """One Chat Completions tool call."""
+    # MedDataOS parses the arguments as JSON; send {} rather than a string it
+    # would reject.
     try:
         json.loads(arguments or "{}")
     except json.JSONDecodeError:
         arguments = "{}"
+
     return {
         "id": call_id,
         "type": "function",

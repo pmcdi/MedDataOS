@@ -32,7 +32,29 @@ CACHE = CACHE_DIR / "dicom" / "references"
 USER_AGENT = "MedDataOS-reference-reader/0.1"
 INDEX_TTL = 7 * 24 * 3600
 MAX_PAGES = 600
-_DROP_TAGS = ["script", "style", "nav", "header", "footer", "noscript", "form", "svg"]
+
+# Page chrome that is never article text.
+NON_CONTENT_TAGS = [
+    "script",
+    "style",
+    "nav",
+    "header",
+    "footer",
+    "noscript",
+    "form",
+    "svg",
+]
+HEADING_TAGS = ("h1", "h2", "h3", "h4")
+TEXT_BLOCK_TAGS = ("p", "li", "td")
+
+# An element whose text is more than this share links is a menu, not the article.
+# Radiology Assistant repeats its whole site menu on every page.
+MAX_LINK_TEXT_SHARE = 0.3
+
+# Okapi BM25 tuning: how fast repeated terms stop adding score, and how much
+# long pages are penalised. These are the usual defaults.
+BM25_TERM_SATURATION = 1.4
+BM25_LENGTH_NORMALISATION = 0.75
 
 
 @dataclass
@@ -55,8 +77,12 @@ class Page:
     headings: list[str] = field(default_factory=list)
 
     def tokens(self) -> list[str]:
-        slug = urlparse(self.url).path.replace("-", " ").replace("/", " ")
-        text = " ".join([self.title, self.title, self.section, slug, *self.headings])
+        url_words = urlparse(self.url).path.replace("-", " ").replace("/", " ")
+
+        # The title is listed twice so a title match outranks a heading match.
+        text = " ".join(
+            [self.title, self.title, self.section, url_words, *self.headings]
+        )
         return tokenize(text)
 
 
@@ -64,15 +90,16 @@ def load_sites(path: Path = CONFIG) -> list[Site]:
     """The configured reference sites."""
     if not path.exists():
         return []
-    data = tomllib.loads(path.read_text())
+
+    config = tomllib.loads(path.read_text())
     return [
         Site(
-            name=entry["name"],
-            base_url=entry["base_url"],
-            sitemap=entry.get("sitemap"),
-            max_depth=int(entry.get("max_depth", 0)),
+            name=site_config["name"],
+            base_url=site_config["base_url"],
+            sitemap=site_config.get("sitemap"),
+            max_depth=int(site_config.get("max_depth", 0)),
         )
-        for entry in data.get("site", [])
+        for site_config in config.get("site", [])
     ]
 
 
@@ -92,7 +119,10 @@ class References:
             timeout=20.0,
             follow_redirects=True,
         )
-        self._lock = threading.Lock()
+
+        # Tool calls run in worker threads; the lock stops two of them building
+        # the same index at once.
+        self._index_lock = threading.Lock()
         self._indexes: dict[str, list[Page]] = {}
 
     # ------------------------------------------------------------------
@@ -100,17 +130,21 @@ class References:
     # ------------------------------------------------------------------
 
     def site_for(self, url: str) -> Site | None:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
+        """The allowlisted site that ``url`` belongs to, or None."""
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in ("http", "https"):
             return None
-        host = parsed.netloc.lower()
+
+        host = parsed_url.netloc.lower()
         for site in self.sites:
+            # Treat example.org and www.example.org as the same site.
             if (
                 host == site.host
                 or host == f"www.{site.host}"
                 or site.host == f"www.{host}"
             ):
                 return site
+
         return None
 
     # ------------------------------------------------------------------
@@ -121,16 +155,23 @@ class References:
         self, query: str, site: str | None = None, limit: int = 5
     ) -> dict[str, Any]:
         """BM25 over page titles, sections, URL slugs and known headings."""
-        sites = [s for s in self.sites if site in (None, "", s.name)]
-        if not sites:
-            names = ", ".join(s.name for s in self.sites) or "none configured"
-            return {"error": f"Unknown site {site!r}. Sites: {names}"}
+        chosen_sites = [
+            candidate for candidate in self.sites if site in (None, "", candidate.name)
+        ]
+        if not chosen_sites:
+            site_names = (
+                ", ".join(candidate.name for candidate in self.sites)
+                or "none configured"
+            )
+            return {"error": f"Unknown site {site!r}. Sites: {site_names}"}
 
         pages: list[Page] = []
-        for entry in sites:
-            pages.extend(self.index(entry))
+        for chosen_site in chosen_sites:
+            pages.extend(self.index(chosen_site))
 
-        hits = _bm25(pages, query, max(1, min(int(limit or 5), 20)))
+        result_limit = max(1, min(int(limit or 5), 20))
+        ranked_pages = _bm25(pages, query, result_limit)
+
         return {
             "query": query,
             "results": [
@@ -140,70 +181,93 @@ class References:
                     "section": page.section,
                     "score": score,
                 }
-                for page, score in hits
+                for page, score in ranked_pages
             ],
         }
 
     def index(self, site: Site) -> list[Page]:
         """Pages of ``site``, from the in-memory or disk cache or freshly built."""
-        with self._lock:
+        with self._index_lock:
             if site.name in self._indexes:
                 return self._indexes[site.name]
-            path = self.cache / f"{_slug(site.name)}.json"
+
+            index_path = self.cache / f"{_slug(site.name)}.json"
             pages: list[Page] | None = None
-            if path.exists() and time.time() - path.stat().st_mtime < INDEX_TTL:
-                pages = [Page(**row) for row in json.loads(path.read_text())]
+            if _is_fresh(index_path):
+                pages = [Page(**saved) for saved in json.loads(index_path.read_text())]
+
             if not pages:
                 pages = self._build_index(site)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps([page.__dict__ for page in pages]))
+                index_path.parent.mkdir(parents=True, exist_ok=True)
+                index_path.write_text(json.dumps([page.__dict__ for page in pages]))
+
             self._indexes[site.name] = pages
             return pages
 
     def _build_index(self, site: Site) -> list[Page]:
-        found: dict[str, Page] = {}
+        pages_by_url: dict[str, Page] = {}
+
         if site.sitemap:
             for url in self._sitemap_urls(site.sitemap):
                 if self.site_for(url) is site:
-                    found.setdefault(url, Page(url=url, title=_title_from_url(url)))
-        if not found:
-            self._crawl_links(site, found)
-        return list(found.values())[:MAX_PAGES]
+                    pages_by_url.setdefault(
+                        url, Page(url=url, title=_title_from_url(url))
+                    )
 
-    def _sitemap_urls(self, url: str) -> list[str]:
+        # Fall back to crawling when there is no sitemap or it listed nothing.
+        if not pages_by_url:
+            self._crawl_links(site, pages_by_url)
+
+        return list(pages_by_url.values())[:MAX_PAGES]
+
+    def _sitemap_urls(self, sitemap_url: str) -> list[str]:
         try:
-            response = self.client.get(url)
+            response = self.client.get(sitemap_url)
             response.raise_for_status()
-            root = ElementTree.fromstring(response.content)
+            sitemap = ElementTree.fromstring(response.content)
         except (httpx.HTTPError, ElementTree.ParseError):
             return []
+
+        # Match on the tag suffix: sitemap tags carry an XML namespace prefix.
         return [
-            el.text.strip() for el in root.iter() if el.tag.endswith("loc") and el.text
+            element.text.strip()
+            for element in sitemap.iter()
+            if element.tag.endswith("loc") and element.text
         ]
 
-    def _crawl_links(self, site: Site, found: dict[str, Page]) -> None:
-        frontier = [site.base_url]
-        seen: set[str] = set()
-        for _ in range(site.max_depth + 1):
-            next_frontier: list[str] = []
-            for url in frontier:
-                if url in seen or len(found) >= MAX_PAGES:
+    def _crawl_links(self, site: Site, pages_by_url: dict[str, Page]) -> None:
+        """Breadth-first crawl from the home page, ``max_depth`` levels deep."""
+        urls_to_visit = [site.base_url]
+        visited: set[str] = set()
+
+        for _depth in range(site.max_depth + 1):
+            next_urls: list[str] = []
+
+            for url in urls_to_visit:
+                if url in visited or len(pages_by_url) >= MAX_PAGES:
                     continue
-                seen.add(url)
+                visited.add(url)
+
                 html = self._get(url)
                 if html is None:
                     continue
-                for link, text in _links(html, url):
-                    if self.site_for(link) is not site or _is_asset(link):
+
+                for link_url, link_text in _links(html, url):
+                    if self.site_for(link_url) is not site or _is_asset(link_url):
                         continue
-                    if link not in found:
-                        found[link] = Page(
-                            url=link,
-                            title=text or _title_from_url(link),
-                            section=_section_from_url(link),
-                        )
-                        next_frontier.append(link)
-            frontier = next_frontier
+                    if link_url in pages_by_url:
+                        continue
+
+                    # The link text is usually the article title, which saves
+                    # fetching every page just to name it.
+                    pages_by_url[link_url] = Page(
+                        url=link_url,
+                        title=link_text or _title_from_url(link_url),
+                        section=_section_from_url(link_url),
+                    )
+                    next_urls.append(link_url)
+
+            urls_to_visit = next_urls
 
     # ------------------------------------------------------------------
     # Read
@@ -216,8 +280,10 @@ class References:
         url = urldefrag(url.strip())[0]
         site = self.site_for(url)
         if site is None:
-            allowed = ", ".join(s.base_url for s in self.sites)
-            return {"error": f"Not an allowlisted reference site. Allowed: {allowed}"}
+            allowed_urls = ", ".join(candidate.base_url for candidate in self.sites)
+            return {
+                "error": f"Not an allowlisted reference site. Allowed: {allowed_urls}"
+            }
 
         html = self._get(url, cache=True)
         if html is None:
@@ -228,11 +294,12 @@ class References:
 
         text = "\n".join(blocks)
         if section:
-            wanted = section.strip().lower()
-            for index, block in enumerate(blocks):
-                if block.startswith("#") and wanted in block.lower():
-                    text = "\n".join(blocks[index:])
+            wanted_heading = section.strip().lower()
+            for block_index, block in enumerate(blocks):
+                if block.startswith("#") and wanted_heading in block.lower():
+                    text = "\n".join(blocks[block_index:])
                     break
+
         max_chars = max(500, min(int(max_chars or 8000), 30000))
         return {
             "url": url,
@@ -246,30 +313,41 @@ class References:
     def _remember_headings(
         self, site: Site, url: str, title: str, headings: list[str]
     ) -> None:
+        """Add a read page's headings to the index, so later searches match them.
+
+        The crawl only sees link text; headings are learned as pages are read.
+        """
         pages = self._indexes.get(site.name)
         if pages is None:
             return
+
         for page in pages:
-            if page.url == url:
-                page.headings = headings
-                if title:
-                    page.title = title
-                return
+            if page.url != url:
+                continue
+
+            page.headings = headings
+            if title:
+                page.title = title
+            return
 
     def _get(self, url: str, cache: bool = False) -> str | None:
-        path = self.cache / "pages" / (_slug(url) + ".html")
-        if cache and path.exists() and time.time() - path.stat().st_mtime < INDEX_TTL:
-            return path.read_text(errors="replace")
+        """HTML of ``url``, or None if it fails or is not HTML."""
+        cached_path = self.cache / "pages" / (_slug(url) + ".html")
+        if cache and _is_fresh(cached_path):
+            return cached_path.read_text(errors="replace")
+
         try:
             response = self.client.get(url)
             response.raise_for_status()
         except httpx.HTTPError:
             return None
+
         if "html" not in response.headers.get("content-type", "html"):
             return None
+
         if cache:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(response.text)
+            cached_path.parent.mkdir(parents=True, exist_ok=True)
+            cached_path.write_text(response.text)
         return response.text
 
 
@@ -287,99 +365,149 @@ def extract(html: str) -> tuple[str, list[str], list[str]]:
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     title = re.sub(r"^The Radiology Assistant\s*:\s*", "", title)
-    for tag in soup(_DROP_TAGS):
+    for tag in soup(NON_CONTENT_TAGS):
         tag.decompose()
 
-    best: Tag | None = None
-    best_score = 0
-    for element in soup.find_all(["main", "article", "section", "div"]):
-        total = len(element.get_text(" ", strip=True))
-        if not total:
-            continue
-        link_chars = sum(
-            len(a.get_text(" ", strip=True)) for a in element.find_all("a")
-        )
-        if link_chars / total > 0.3:
-            continue
-        score = sum(len(p.get_text(" ", strip=True)) for p in element.find_all("p"))
-        if score > best_score:
-            best, best_score = element, score
-    root = best or soup.body or soup
+    content_root = _main_content(soup)
 
     headings: list[str] = []
     blocks: list[str] = []
-    for element in root.find_all(["h1", "h2", "h3", "h4", "p", "li", "td"]):
-        if element.find_parent(["p", "li", "td"]) is not None:
+    for element in content_root.find_all([*HEADING_TAGS, *TEXT_BLOCK_TAGS]):
+        # A block inside another block would be emitted twice.
+        if element.find_parent(list(TEXT_BLOCK_TAGS)) is not None:
             continue
+
         text = element.get_text(" ", strip=True)
+        # Labels of the site's image-viewer buttons, not article text.
         if not text or text in ("Enable Scroll", "Disable Scroll"):
             continue
-        if element.name in ("h1", "h2", "h3", "h4"):
-            level = int(element.name[1])
+
+        if element.name in HEADING_TAGS:
+            heading_level = int(element.name[1])
             headings.append(text)
-            blocks.append(f"{'#' * level} {text}")
+            blocks.append(f"{'#' * heading_level} {text}")
         elif element.name == "li":
             blocks.append(f"- {text}")
         else:
             blocks.append(text)
+
     return title, headings, blocks
 
 
-def _links(html: str, base: str) -> list[tuple[str, str]]:
+def _main_content(soup: BeautifulSoup) -> Tag | BeautifulSoup:
+    """The element with the most paragraph text that is not mostly links."""
+    best_element: Tag | None = None
+    best_paragraph_chars = 0
+
+    for element in soup.find_all(["main", "article", "section", "div"]):
+        total_chars = len(element.get_text(" ", strip=True))
+        if not total_chars:
+            continue
+
+        link_chars = sum(
+            len(anchor.get_text(" ", strip=True)) for anchor in element.find_all("a")
+        )
+        if link_chars / total_chars > MAX_LINK_TEXT_SHARE:
+            continue
+
+        paragraph_chars = sum(
+            len(paragraph.get_text(" ", strip=True))
+            for paragraph in element.find_all("p")
+        )
+        if paragraph_chars > best_paragraph_chars:
+            best_element, best_paragraph_chars = element, paragraph_chars
+
+    return best_element or soup.body or soup
+
+
+def _links(html: str, base_url: str) -> list[tuple[str, str]]:
+    """(absolute URL, link text) for each link on the page."""
     soup = BeautifulSoup(html, "html.parser")
-    out = []
+    links = []
+
     for anchor in soup.find_all("a", href=True):
         href = str(anchor["href"])
         if href.startswith(("mailto:", "javascript:", "tel:")):
             continue
-        url = urldefrag(urljoin(base, href))[0].split("?")[0].rstrip("/")
-        out.append((url, anchor.get_text(" ", strip=True)))
-    return out
+
+        # Drop the fragment, query and trailing slash so one page has one URL.
+        absolute_url = urldefrag(urljoin(base_url, href))[0].split("?")[0].rstrip("/")
+        links.append((absolute_url, anchor.get_text(" ", strip=True)))
+
+    return links
 
 
 def _is_asset(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return "/site/" in path or bool(
-        re.search(r"\.(png|jpe?g|gif|svg|ico|css|js|json|xml|pdf|mp4|zip)$", path)
+    url_path = urlparse(url).path.lower()
+
+    # /site/ holds Radiology Assistant's theme files.
+    return "/site/" in url_path or bool(
+        re.search(r"\.(png|jpe?g|gif|svg|ico|css|js|json|xml|pdf|mp4|zip)$", url_path)
     )
 
 
 def _title_from_url(url: str) -> str:
-    last = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
-    return last.replace("-", " ").strip().capitalize() or url
+    last_segment = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+    return last_segment.replace("-", " ").strip().capitalize() or url
 
 
 def _section_from_url(url: str) -> str:
-    parts = [p for p in urlparse(url).path.split("/") if p]
-    return " / ".join(p.replace("-", " ") for p in parts[:-1])
+    """The folders above a page, e.g. ``head neck / cervical node mapping``."""
+    path_segments = [segment for segment in urlparse(url).path.split("/") if segment]
+    return " / ".join(segment.replace("-", " ") for segment in path_segments[:-1])
 
 
 def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")[:150]
 
 
+def _is_fresh(path: Path) -> bool:
+    return path.exists() and time.time() - path.stat().st_mtime < INDEX_TTL
+
+
 def _bm25(pages: list[Page], query: str, limit: int) -> list[tuple[Page, float]]:
-    docs = [page.tokens() for page in pages]
-    if not docs:
+    """Rank ``pages`` against ``query`` with Okapi BM25; best ``limit`` first."""
+    page_tokens = [page.tokens() for page in pages]
+    if not page_tokens:
         return []
-    terms = list(dict.fromkeys(tokenize(query)))
-    df: Counter[str] = Counter()
-    for tokens in docs:
-        df.update(set(tokens))
-    avgdl = sum(len(tokens) for tokens in docs) / len(docs) or 1.0
-    k1, b = 1.4, 0.75
-    scored = []
-    for page, tokens in zip(pages, docs, strict=True):
-        counts = Counter(tokens)
-        dl = len(tokens) or 1
+
+    query_terms = list(dict.fromkeys(tokenize(query)))  # unique, in order
+
+    # How many pages contain each term: rare terms count for more.
+    pages_containing: Counter[str] = Counter()
+    for tokens in page_tokens:
+        pages_containing.update(set(tokens))
+
+    page_count = len(page_tokens)
+    average_page_length = sum(len(tokens) for tokens in page_tokens) / page_count or 1.0
+
+    ranked: list[tuple[Page, float]] = []
+    for page, tokens in zip(pages, page_tokens, strict=True):
+        term_counts = Counter(tokens)
+        page_length = len(tokens) or 1
+        length_factor = (
+            1
+            - BM25_LENGTH_NORMALISATION
+            + BM25_LENGTH_NORMALISATION * page_length / average_page_length
+        )
+
         score = 0.0
-        for term in terms:
-            tf = counts.get(term, 0)
-            if not tf:
+        for term in query_terms:
+            term_count = term_counts.get(term, 0)
+            if not term_count:
                 continue
-            idf = math.log(1 + (len(docs) - df[term] + 0.5) / (df[term] + 0.5))
-            score += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+
+            containing = pages_containing[term]
+            rarity = math.log(1 + (page_count - containing + 0.5) / (containing + 0.5))
+            score += (
+                rarity
+                * term_count
+                * (BM25_TERM_SATURATION + 1)
+                / (term_count + BM25_TERM_SATURATION * length_factor)
+            )
+
         if score > 0:
-            scored.append((page, round(score, 3)))
-    scored.sort(key=lambda item: -item[1])
-    return scored[:limit]
+            ranked.append((page, round(score, 3)))
+
+    ranked.sort(key=lambda ranked_page: -ranked_page[1])
+    return ranked[:limit]
