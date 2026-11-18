@@ -73,9 +73,9 @@ url = "http://127.0.0.1:8002/v1"
 description = "Answers from clinical notes with verified quotes, dates, and conflicts."
 modalities = ["note"]
 
-[imaging]
-url = "http://127.0.0.1:8003/v1"
-description = "Looks at one DICOM slice. Use this for questions about the images, scans, contours, or what is visible on imaging."
+[dicom]
+url = "http://127.0.0.1:8005/v1"
+description = "DICOM and radiology specialist. ..."
 
 [tabular]
 url = "http://127.0.0.1:8004/v1"
@@ -180,19 +180,9 @@ It opens that case itself and returns citation JSON. Each citation is tagged `cl
 
 Beside its citations it sends `abstentions` (what the notes do not document) and `facts` (the ledger facts behind each cited claim, keyed by attribute such as `social_history.smoking`). Context from a consult is shown to its model to frame the question. It is never cited, and every claim is still verified against the notes.
 
-## Imaging specialist (stand-in)
+## DICOM specialist
 
-A temporary imaging specialist, `pixi run imaging --case /path/to/case` from the root of this repo, stands in until a fuller imaging agent exists. Both specialists read `GEMINI_API_KEY` from this repo's `.env`. It prints `http://127.0.0.1:8003/v1`. Register it next to notes:
-
-```toml
-[imaging]
-url = "http://127.0.0.1:8003/v1"
-description = "Looks at one DICOM slice. Use this for questions about the images, scans, contours, or what is visible on imaging."
-```
-
-It ranks the case's series against the question, renders one preview slice (with contours for an RTSTRUCT or when the question asks for them), and describes that slice with a vision model (Gemini). A confident pick becomes one citation for the series file, tagged `imaging`, with a `preview` of the slice index, window, and overlay; the page loads that slice from `/api/dicom/preview`. Its citations reach the page with `basis.type` `model_read` and `checked` `none`.
-
-If no series ranks confidently, the reply cites nothing and lists the ranked series ids under `needs` as `options`. A consult that passes one of them in `resource_ids` reads that series. The stand-in owns no modality, so the router may still fetch series metadata and volumes itself. Any agent can take its place as long as it answers the same way.
+The DICOM specialist is `pixi run dicom`. It is built on the OpenAI Agents SDK and reads the case only through the datactrl tools the server sends. It can also search allowlisted radiology reference sites and run Python in a sandbox on fetched volumes. See [DICOM specialist](specialists/dicom.md).
 
 ## Tabular specialist
 
@@ -215,7 +205,7 @@ Sources that disagree are compared with the notes specialist's conflict logic (`
 
 ## Azure OpenAI
 
-The example router and the orchestrator speak Azure when these are set in this repo's `.env`. The notes, imaging, and tabular specialists read the same variables from the same file:
+The example router and the orchestrator speak Azure when these are set in this repo's `.env`. The notes, DICOM, and tabular specialists read the same variables from the same file:
 
 ```bash
 AZURE_OPENAI_API_KEY=

@@ -7,11 +7,12 @@ url = "http://127.0.0.1:8002/v1"
 description = "Answers from clinical notes with verified quotes, dates, and conflicts. Use this for questions about the chart, history, labs in notes, and discrepancies between notes."
 modalities = ["note"]
 
-# The stand-in looks at one slice and cannot measure. It owns no modality, so
-# the router can still fetch series metadata and volumes itself.
-[imaging]
-url = "http://127.0.0.1:8003/v1"
-description = "Looks at one DICOM slice. Use this for questions about the images, scans, contours, or what is visible on imaging."
+# The DICOM specialist owns no modality for now, so the router can still read
+# series metadata itself. Add modalities = ["dicom"] to route all DICOM reads
+# through it.
+[dicom]
+url = "http://127.0.0.1:8005/v1"
+description = "DICOM and radiology specialist. Use this for questions about the scans and series (metadata, acquisition, structures and their links), for quantitative image analysis such as structure volumes, sizes, and intensity or HU statistics, and for radiology background such as anatomy, classification systems, and staging from reference sites."
 
 [tabular]
 url = "http://127.0.0.1:8004/v1"

@@ -51,7 +51,7 @@ sequenceDiagram
     Page-->>User: Answer in the chat
 ```
 
-[Connect an agent](agents.md) is the request and citation contract. [Page](page.md) is what the browser shows. [Notes](specialists/notes.md), [imaging](specialists/imaging.md), and [tabular](specialists/tabular.md) are optional specialists the router can call. [The orchestrator](agents.md#the-orchestrator) is the router that plans, consults, reconciles, and gap-checks in code.
+[Connect an agent](agents.md) is the request and citation contract. [Page](page.md) is what the browser shows. [Notes](specialists/notes.md), [DICOM](specialists/dicom.md), and [tabular](specialists/tabular.md) are optional specialists the router can call. [The orchestrator](agents.md#the-orchestrator) is the router that plans, consults, reconciles, and gap-checks in code.
 
 ## Settings
 
@@ -64,5 +64,5 @@ Names match `.env.example`.
 | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` | Azure, for the example agent and the specialists, when all three are set. |
 | `AZURE_OPENAI_API_VERSION` | Azure API date, such as `2024-10-21`. |
 | `AZURE_OPENAI_REASONING_EFFORT` | Set to `none` when a reasoning model refuses function tools. |
-| `GEMINI_API_KEY` | Notes, imaging, and tabular when Azure is not set. |
+| `GEMINI_API_KEY` | Notes and tabular when Azure is not set. |
 | `HOST`, `PORT` | Page bind address. Defaults are `127.0.0.1` and `8080`. |

@@ -8,7 +8,7 @@ Start it on the same case as the server:
 pixi run notes --case /path/to/case
 ```
 
-It prints an address such as `http://127.0.0.1:8002/v1`. `pixi run stack` starts it with the router and the imaging specialist. Register it in `configs/agents.toml`:
+It prints an address such as `http://127.0.0.1:8002/v1`. `pixi run stack` starts it with the router and the DICOM specialist. Register it in `configs/agents.toml`:
 
 ```toml
 [notes]

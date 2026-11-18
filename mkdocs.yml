@@ -25,7 +25,7 @@ nav:
   - Case data: data.md
   - Specialists:
       - Notes: specialists/notes.md
-      - Imaging: specialists/imaging.md
+      - DICOM: specialists/dicom.md
       - Tabular: specialists/tabular.md
   - datactrl:
       - API: datactrl/README.md

@@ -35,7 +35,7 @@ AGENTS_FILE = ROOT / "configs" / "agents.toml"
 ROUTER_PORT = 8001
 SPECIALIST_MODULES = {
     "notes": "meddataos.specialists.notes.serve",
-    "imaging": "meddataos.specialists.imaging.serve",
+    "dicom": "meddataos.specialists.dicom.serve",
     "tabular": "meddataos.specialists.tabular.serve",
 }
 ROUTERS = {

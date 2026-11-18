@@ -1,4 +1,4 @@
-"""What the notes and imaging specialists send back beside their citations."""
+"""What the notes specialist sends back beside its citations."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ from types import SimpleNamespace
 
 from meddataos.datactrl import Case
 from meddataos.specialists.common import latest_request, parse_request
-from meddataos.specialists.imaging import serve as imaging_serve
-from meddataos.specialists.imaging.read import SliceRead
 from meddataos.specialists.notes import agent as notes_agent
 from meddataos.specialists.notes import serve as notes_serve
 from meddataos.specialists.notes.ledger import Ledger
@@ -150,30 +148,6 @@ def test_context_frames_the_notes_question_without_becoming_evidence(tmp_path, m
     assert "Question: Does the patient smoke?\n\nContext from other specialists" in prompts[0]
     assert "The registry row says Current (tabular.1)" in prompts[0]
     assert "do not cite it" in prompts[0]
-
-
-def test_imaging_without_a_confident_series_states_what_it_needs():
-    unsure = SliceRead(
-        summary="No confident DICOM series match.", file="dicom_select.txt",
-        candidates=["dicom:ct", "dicom:mr"],
-    )
-    sure = SliceRead(
-        summary="The larynx is visible. It is one slice.", file="ct.png",
-        series_id="dicom:ct", series_path="Neck CT", preview={"slice_index": 3, "window": "ct"},
-    )
-
-    reply = json.loads(imaging_serve.cited_reply(unsure))
-
-    assert reply["citations"] == []
-    assert reply["needs"] == [{
-        "what": "which series to read, passed as resource_ids",
-        "why": "No series matched the question with confidence.",
-        "options": ["dicom:ct", "dicom:mr"],
-    }]
-    assert json.loads(imaging_serve.cited_reply(sure))["citations"][0]["preview"]["slice_index"] == 3
-    assert imaging_serve.cited_reply(SliceRead(summary="No DICOM series in this case.", file="x")) == (
-        "No DICOM series in this case."
-    )
 
 
 def test_a_notes_conflict_goes_only_on_the_citations_it_involves(tmp_path):
