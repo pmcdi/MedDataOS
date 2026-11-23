@@ -326,13 +326,14 @@ const MedEvidence = (() => {
 
     // ── What a specialist was asked and what came back ──────────────────
     function consultDetail(step) {
-        if (step.kind !== 'consult' || !(step.question || step.reply)) return '';
+        const subagent = step.kind === 'subagent' || step.kind === 'consult';
+        if (!subagent || !(step.question || step.reply)) return '';
         const row = (label, text, cls = '') => text
             ? `<div class="consult-row ${cls}"><span class="consult-label">${label}</span><span class="consult-text">${esc(text)}</span></div>` : '';
         const list = (label, items, cls) => Array.isArray(items) && items.length
             ? row(label, items.join('; '), cls) : '';
         return `<div class="consult-detail">`
-            + row('Asked', step.question)
+            + row('Task', step.question)
             + row('With', step.context, 'consult-context')
             + row(step.status === 'error' ? 'Failed' : 'Replied', String(step.reply || '').replace(/\[cite:[^\]]+\]/g, '').replace(/\s+([.,;])/g, '$1'))
             + list('Needs', step.needs, 'consult-needs')

@@ -1,17 +1,23 @@
 site_name: MedDataOS
-site_description: A local page for questions about the files in one case folder.
+site_description: Cited, checked answers to questions about one patient's files.
 docs_dir: docs
 
 theme:
   name: material
   features:
     - navigation.sections
+    - navigation.tabs
+    - navigation.footer
     - content.code.copy
+    - content.tabs.link
     - search.suggest
 
 markdown_extensions:
   - admonition
+  - tables
   - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
   - pymdownx.superfences:
       custom_fences:
         - name: mermaid
@@ -19,18 +25,38 @@ markdown_extensions:
           format: !!python/name:pymdownx.superfences.fence_code_format
 
 nav:
-  - Start: index.md
-  - Connect an agent: agents.md
-  - Page: page.md
-  - Case data: data.md
-  - Specialists:
-      - Notes: specialists/notes.md
-      - DICOM: specialists/dicom.md
-      - Tabular: specialists/tabular.md
-  - datactrl:
-      - API: datactrl/README.md
-      - Design: datactrl/DESIGN.md
+  - Home: index.md
+  - Get started: getting-started.md
+  - Use the page: using-the-page.md
+  - Concepts:
+      - How it works: concepts/how-it-works.md
+      - Cited answers: concepts/citations.md
+  - Guides:
+      - Connect a model: guides/models.md
+      - Turn on the sandbox: guides/sandbox.md
+      - Set up TotalSegmentator: guides/totalsegmentator.md
+      - Add an MCP server: guides/mcp-servers.md
+      - Write a skill: guides/skills.md
+      - Define an agent: guides/agents.md
+      - Use an external agent: guides/external-agent.md
+      - Run the evals: guides/evals.md
+      - Troubleshooting: guides/troubleshooting.md
+  - Reference:
+      - Settings: reference/settings.md
+      - Harness config: reference/harness-config.md
+      - MCP registration: reference/mcp-registration.md
+      - Tools: reference/tools.md
+      - Answer format: reference/answer-format.md
+      - Agent protocol: reference/agent-protocol.md
+      - HTTP API: reference/http-api.md
+      - Storage: reference/storage.md
+      - datactrl API: datactrl/README.md
+      - datactrl design: datactrl/DESIGN.md
+  - Development:
+      - Code map: development/architecture.md
+      - Testing: development/testing.md
 
 validation:
   absolute_links: warn
   unrecognized_links: warn
+  anchors: warn

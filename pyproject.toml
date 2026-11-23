@@ -1,7 +1,7 @@
 [project]
 name = "meddataos"
 version = "0.2.0"
-description = "Web UI, datactrl case access, and specialist agents for one local case."
+description = "Web UI, datactrl case access, and an agent harness for one local case."
 authors = [{ name = "Joshua Siraj", email = "joshua.siraj@ryerson.ca" }]
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -24,26 +24,15 @@ server = [
     "python-multipart>=0.0.6,<1",
     "websockets>=12.0,<18",
     "python-dotenv>=1.0.0,<2",
-]
-specialists = [
-    "meddataos[datactrl]",
-    "google-genai>=1.0.0",
-    "python-dateutil>=2.9",
-    "python-dotenv>=1.0.0,<2",
-]
-# The orchestrator compares facts with the notes specialist's conflict logic.
-orchestrator = [
-    "meddataos[specialists]",
-]
-dicom = [
-    "meddataos[datactrl]",
-    "openai-agents>=0.24,<0.25",
-    "openai>=3,<4",
+    # The harness's reference reader (meddataos.harness.references).
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
-    "fastapi>=0.104.0,<1",
-    "uvicorn[standard]>=0.24.0,<1",
-    "python-dotenv>=1.0.0,<2",
+    # The notes ledger's Gemini backend, used when Azure is not configured.
+    "google-genai>=1.0.0",
+    # The ledger's timeline anchors relative dates ("3 months after surgery").
+    "python-dateutil>=2.9",
+    # MCP servers the harness consumes (meddataos.harness.mcp).
+    "mcp>=2.3,<3",
 ]
 
 [build-system]

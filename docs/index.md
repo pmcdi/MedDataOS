@@ -1,68 +1,24 @@
 # MedDataOS
 
-A local page for asking questions about the files in one folder. The server opens that folder with [datactrl](datactrl/README.md), serves the files, and sends each question to an OpenAI-compatible chat completions endpoint.
+MedDataOS answers questions about one patient's files. Point it at a folder of clinical notes, lab tables and DICOM studies, open the page in your browser, and ask. Each answer comes back with citations to the files it used, and the server checks every citation against what was actually read before you see it.
 
-One process opens one folder. Chats, pins, review checkboxes, and audit runs are saved for that folder and come back when you reopen the same case. See [Case data](data.md).
+Everything runs on your machine. The only thing that leaves it is the conversation with the model you choose: Azure OpenAI, OpenAI, or a local server such as Ollama or vLLM.
 
-## Start
+## What makes it different
 
-Copy `.env.example` to `.env`, then from the repository root:
+- **Answers are checked, not trusted.** A quote must appear in the note it cites. A lab value must be the cell it names. A number in a sentence must be one the cited read returned. An answer that fails goes back to the model with the reason, up to six times. [Cited answers](concepts/citations.md) explains the rules.
+- **One audited path to the data.** The model reads the case only through the controller (datactrl), so every file it opened is recorded against the question and saved in an audit log.
+- **Tools that fit the data.** Beyond reading files, the model can run code in a sandbox, look up radiology references, search a ledger of facts from the notes, segment anatomy with TotalSegmentator, and hand parts of a question to focused subagents.
 
-```bash
-pixi run stack data/TCGA-DD-A4NF
-```
+## Where to start
 
-That starts the orchestrator as the router, the specialists in `configs/agents.toml` (notes, imaging, and tabular), and the server. `--router example` uses the example agent instead. Ctrl-C stops them. To start the pieces yourself, run `pixi run agent` and then:
-
-```bash
-pixi run serve /path/to/folder --agent-url http://127.0.0.1:8001/v1
-```
-
-Open the URL the server prints. `pixi run docs` serves this site, and `pixi run test` runs the server, datactrl, and specialist tests. The repository README is the GitHub landing page for the same quick start.
-
-## What a question goes through
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Page
-    participant Server as MedDataOS server
-    participant Agent as Agent at --agent-url
-    participant Folder as Case folder
-
-    User->>Page: Ask a question
-    Page->>Server: POST /api/chat
-    Server->>Agent: Chat so far, file list, citation rule, tools
-    loop Until the agent stops calling tools, at most 16 rounds
-        Agent-->>Server: Tool call
-        Server->>Folder: Run it with datactrl
-        Server->>Page: step
-        Server->>Agent: Tool result
-    end
-    Server->>Page: status while the agent writes or citations are checked
-    Agent-->>Server: Answer
-    Server->>Server: Check citations against describe and fetch calls
-    alt Citations missing or wrong
-        Server->>Agent: Refusal and the reason, up to 6 corrections
-        Agent-->>Server: Corrected answer
-    end
-    Server->>Server: Save the chat and an audit run
-    Server->>Page: assistant message
-    Page-->>User: Answer in the chat
-```
-
-[Connect an agent](agents.md) is the request and citation contract. [Page](page.md) is what the browser shows. [Notes](specialists/notes.md), [DICOM](specialists/dicom.md), and [tabular](specialists/tabular.md) are optional specialists the router can call. [The orchestrator](agents.md#the-orchestrator) is the router that plans, consults, reconciles, and gap-checks in code.
-
-## Settings
-
-Names match `.env.example`.
-
-| Variable | Used for |
+| You want to | Read |
 |---|---|
-| `AGENT_MODEL`, `AGENT_API_KEY`, `AGENT_TIMEOUT` | What the server sends to `--agent-url`. Timeout default is 120 seconds. |
-| `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_API_KEY` | The example agent. It ignores `AGENT_MODEL`. |
-| `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` | Azure, for the example agent and the specialists, when all three are set. |
-| `AZURE_OPENAI_API_VERSION` | Azure API date, such as `2024-10-21`. |
-| `AZURE_OPENAI_REASONING_EFFORT` | Set to `none` when a reasoning model refuses function tools. |
-| `GEMINI_API_KEY` | Notes and tabular when Azure is not set. |
-| `HOST`, `PORT` | Page bind address. Defaults are `127.0.0.1` and `8080`. |
+| Try it on the sample case in ten minutes | [Get started](getting-started.md) |
+| Ask questions and check the answers | [Use the page](using-the-page.md) |
+| Understand what happens to a question | [How it works](concepts/how-it-works.md) |
+| Connect your model, turn on the sandbox, add TotalSegmentator | [Guides](guides/models.md) |
+| Look up a setting, a tool or the answer format | [Reference](reference/settings.md) |
+| Change the code | [Code map](development/architecture.md) |
+
+Something not working? See [Troubleshooting](guides/troubleshooting.md).

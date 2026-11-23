@@ -1,0 +1,144 @@
+[
+  {
+    "id": "dicom-radcure-structures",
+    "patient_id": "RADCURE-0006",
+    "type": "metadata",
+    "question": "Which structures are contoured on the planning CT?",
+    "expect": [
+      [
+        "spinalcord",
+        "spinal cord"
+      ],
+      [
+        "gtvp",
+        "gtv"
+      ],
+      [
+        "larynx"
+      ],
+      [
+        "esophagus",
+        "oesophagus"
+      ],
+      [
+        "submand"
+      ]
+    ]
+  },
+  {
+    "id": "dicom-radcure-ct-geometry",
+    "patient_id": "RADCURE-0006",
+    "type": "metadata",
+    "question": "How many slices does the planning CT have, and what is the slice thickness?",
+    "expect": [
+      [
+        "181"
+      ],
+      [
+        "re:\\b2(\\.0+)? ?mm"
+      ]
+    ]
+  },
+  {
+    "id": "dicom-radcure-date",
+    "patient_id": "RADCURE-0006",
+    "type": "metadata",
+    "question": "When was the planning CT acquired?",
+    "expect": [
+      [
+        "date:2006-01-08"
+      ]
+    ]
+  },
+  {
+    "id": "dicom-radcure-gtv-volume",
+    "patient_id": "RADCURE-0006",
+    "type": "quantitative",
+    "question": "What is the volume of the primary gross tumour (GTVp)?",
+    "expect": [],
+    "expect_number": {
+      "min": 1.9,
+      "max": 2.7,
+      "units": [
+        "ml",
+        "cm3",
+        "cm³",
+        "cc",
+        "cubic"
+      ],
+      "why": "Filled-pixel count gives 2.25 mL and polygon area 2.13 mL; an earlier specialist run reported 2.592 cm3. The range admits reasonable rasterisations."
+    }
+  },
+  {
+    "id": "dicom-radcure-gtv-level",
+    "patient_id": "RADCURE-0006",
+    "type": "segmentation",
+    "question": "At which cervical vertebral level is the primary tumour (GTVp)?",
+    "expect": [
+      [
+        "re:\\bc ?[67]\\b"
+      ]
+    ],
+    "why": "Needs the GTVp from the RTSTRUCT and the vertebrae from TotalSegmentator. The RTSTRUCT GTVp spans z -990 to -1004 mm (centroid about -997); TotalSegmentator 2.18 full resolution puts the C6 centroid at z -985.8 and C7 at -996.7, so C6-C7, mostly C7. A glottic primary at C6-C7 fits an 87-year-old, whose larynx sits low."
+  },
+  {
+    "id": "dicom-tcga-ct-series",
+    "patient_id": "TCGA-DD-A4NF",
+    "type": "metadata",
+    "question": "How many CT series are there, and on what date was the CT done?",
+    "expect": [
+      [
+        "re:\\b(4|four)\\b"
+      ],
+      [
+        "date:2004-02-21"
+      ]
+    ]
+  },
+  {
+    "id": "dicom-tcga-mr-dates",
+    "patient_id": "TCGA-DD-A4NF",
+    "type": "metadata",
+    "question": "On which dates were MRI studies done?",
+    "expect": [
+      [
+        "date:2004-02-24"
+      ],
+      [
+        "date:2004-02-29"
+      ],
+      [
+        "date:2005-04-04"
+      ]
+    ]
+  },
+  {
+    "id": "dicom-tcga-thinnest-ct",
+    "patient_id": "TCGA-DD-A4NF",
+    "type": "metadata",
+    "question": "Which CT series has the thinnest slices, and how many images does it have?",
+    "expect": [
+      [
+        "runoff"
+      ],
+      [
+        "1338",
+        "1,338"
+      ]
+    ]
+  },
+  {
+    "id": "dicom-lirads-reference",
+    "patient_id": "TCGA-DD-A4NF",
+    "type": "reference",
+    "question": "What does a LI-RADS LR-5 category mean?",
+    "expect": [
+      [
+        "definitely hcc",
+        "definite hcc",
+        "definitely hepatocellular",
+        "definite hepatocellular"
+      ]
+    ]
+  }
+]

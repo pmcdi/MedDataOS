@@ -1,10 +1,11 @@
-"""Hold the conversation with the agent at --agent-url for each question.
+"""Hold the conversation with the model or agent for each question.
 
-The agent is any OpenAI-compatible chat completions endpoint: a plain model,
-or an agent served behind that API. Tool calls it makes are run here on the
-open case, its answer is sent back for correction until the citations pass,
-and the accepted answer is pushed to every open page. At startup the agent
-also fills in the patient card from the files.
+With --agent-url the router is any OpenAI-compatible chat completions endpoint:
+a plain model, or an agent served behind that API. With --harness the server
+talks to the model itself, through ``meddataos.harness``. Either way, tool calls
+are run here on the open case, the answer is sent back for correction until the
+citations pass, and the accepted answer is pushed to every open page. At startup
+the same model or agent also fills in the patient card from the files.
 
 """
 
@@ -13,16 +14,35 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from meddataos.server import answer, findings, store
-from meddataos.server.case import Answer, Contract, Profile, case
-from meddataos.server.registry import Specialist
+from meddataos.core.datactrl import Case as DatactrlCase
+from meddataos.core.loop import ToolLoop
+from meddataos.core.model import (
+    ChatCompletionsClient,
+    ModelClient,
+    client_from_settings,
+    settings_from_env,
+)
+from meddataos.core.registry import Evidence, citing_rule, evidence_of
+from meddataos.core.verifier import Answer, Contract, schema
+from meddataos.core.workspace import offload_payloads, workspace_for
+from meddataos.harness.agents import (
+    AGENTS_DIR,
+    Agent,
+    load_agents,
+    offered_tools,
+    spawn_tool,
+)
+from meddataos.harness.mcp import summary as mcp_summary
+from meddataos.harness.outbound import OutboundScreen
+from meddataos.harness.tools import HarnessTools
+from meddataos.server import findings, store
+from meddataos.server.case import Profile, case
 from meddataos.server.state import log, short_session, state
 
 _tasks: set[asyncio.Task] = set()
@@ -43,6 +63,12 @@ _TOOL_LABELS = {
     "assert_link": "Checking a link",
     "dicom_tree": "Reading the DICOM tree",
     "dicom_groups": "Grouping DICOM series",
+    "reference_search": "Searching references",
+    "reference_read": "Reading a reference",
+    "load_skill": "Loading a skill",
+    "ledger_query": "Searching the notes ledger",
+    "notes_timeline": "Reading the notes timeline",
+    "notes_conflicts": "Checking where the notes disagree",
 }
 
 
@@ -69,6 +95,11 @@ def _file_label(arguments: dict) -> str:
 
 
 def _tool_label(name: str, arguments: dict) -> str:
+    # mcp__<server>__<tool> reads as "Running <tool> on <server>".
+    if name.startswith("mcp__") and name.count("__") >= 2:
+        _, server, tool = name.split("__", 2)
+        return f"Running {tool} on {server}"
+
     action = _TOOL_LABELS.get(name, name or "Running a tool")
     target = _file_label(arguments)
 
@@ -80,7 +111,13 @@ def _tool_label(name: str, arguments: dict) -> str:
 
 def _cite_kind(modality: str) -> str:
     """The citation type a finished read stands for, from the file's modality."""
-    return {"dicom": "imaging", "note": "note", "structured": "table"}.get(modality, "")
+    kinds = {
+        "dicom": "imaging",
+        "note": "note",
+        "structured": "table",
+        "derived": "derived",
+    }
+    return kinds.get(modality, "")
 
 
 def _stamp_answer_kinds(steps: list[dict], message: str) -> None:
@@ -126,17 +163,20 @@ def _stamp_answer_kinds(steps: list[dict], message: str) -> None:
         if kind:
             step["cite_kind"] = kind
 
-        used = sources.get(step.get("cite"))
+        step_sources = sources.get(step.get("cite"))
 
-        if used:
-            step["sources"] = used
+        if step_sources:
+            step["sources"] = step_sources
 
 
 _step_started: dict[str, float] = {}
 
 
 def _live(session_id: str):
-    """The session while its question is open. The patient card and late replies have none."""
+    """The session while its question is open.
+
+    The patient card and replies that arrive late have none.
+    """
     if not session_id or session_id not in state.pending:
         return None
 
@@ -144,7 +184,7 @@ def _live(session_id: str):
 
 
 async def record_step(session_id: str, step: dict) -> None:
-    """Remember one step on the session and push it, with how long it took once it ends."""
+    """Remember one step on the session and push it, timed once it ends."""
     session = _live(session_id)
 
     if session is None:
@@ -171,7 +211,7 @@ async def record_step(session_id: str, step: dict) -> None:
 
 
 async def set_status(session_id: str, label: str) -> None:
-    """Say what the open question is waiting on, such as the model or the citation check."""
+    """Say what the open question is waiting on: the model, or the citation check."""
     session = _live(session_id)
 
     if session is None or session.status == label:
@@ -181,110 +221,25 @@ async def set_status(session_id: str, label: str) -> None:
     await state.hub.status(session_id, label, session.elapsed_ms())
 
 
-class AgentError(Exception):
-    """The agent endpoint failed or returned something that is not a chat completion."""
+def router_client() -> ModelClient:
+    """The model or agent the router conversation and the patient card talk to.
 
-    def __init__(self, message: str, status: int | None = None) -> None:
-        """Remember the HTTP status when the endpoint returned one."""
-        super().__init__(message)
-        self.status = status
+    With --harness it is the model itself, from the harness settings. Otherwise
+    it is the agent at --agent-url.
+    """
+    if state.harness:
+        return client_from_settings(settings_from_env())
 
-
-class AgentClient:
-    """HTTP client for the OpenAI-compatible endpoint at --agent-url."""
-
-    def __init__(self, url: str, model: str, key: str | None, timeout: float) -> None:
-        """The completions URL, model name, optional key, and timeout."""
-        self.url = url
-        self.model = model
-        self.key = key
-        self.timeout = timeout
-
-    @classmethod
-    def from_env(cls) -> AgentClient:
-        """Client from --agent-url and the AGENT_* environment variables."""
-        return cls(
-            state.agent_url or "",
-            os.getenv("AGENT_MODEL", ""),
-            os.getenv("AGENT_API_KEY"),
-            float(os.getenv("AGENT_TIMEOUT", "120")),
-        )
-
-    def complete(
-        self,
-        messages: list[dict],
-        tools: list[dict],
-        response_format: dict | None = None,
-    ) -> dict:
-        """One chat completions request. Returns the assistant message."""
-        headers = {"Content-Type": "application/json"}
-
-        if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
-
-        body: dict = {"model": self.model, "messages": messages}
-
-        if tools:
-            body["tools"] = tools
-
-        if response_format:
-            body["response_format"] = response_format
-
-        request = urllib.request.Request(
-            f"{self.url}/chat/completions",
-            data=json.dumps(body).encode(),
-            headers=headers,
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                payload = json.load(response)
-        except urllib.error.HTTPError as exc:
-            raise AgentError(self._http_error(exc), exc.code) from exc
-        except urllib.error.URLError as exc:
-            raise AgentError(f"could not reach {self.url}: {exc.reason}") from exc
-        except json.JSONDecodeError as exc:
-            raise AgentError(f"{self.url} did not return JSON") from exc
-
-        try:
-            message = payload["choices"][0]["message"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise AgentError(f"{self.url} did not return a chat completion") from exc
-
-        if not isinstance(message, dict):
-            raise AgentError(f"{self.url} did not return a chat completion")
-
-        return message
-
-    def _http_error(self, exc: urllib.error.HTTPError) -> str:
-        detail = ""
-
-        try:
-            body = json.loads(exc.read() or b"{}")
-            error = body.get("error") if isinstance(body, dict) else None
-            detail = (
-                error.get("message", "")
-                if isinstance(error, dict)
-                else str(error or "")
-            )
-        except (OSError, json.JSONDecodeError):
-            pass
-
-        return f"{self.url} answered {exc.code}" + (f": {detail}" if detail else "")
+    return _agent_client(state.agent_url or "")
 
 
 # How often one question may consult. A repeat of the same call is answered from
 # the first one and does not count.
-MAX_CONSULTS_PER_SPECIALIST = 3
+MAX_CONSULTS_PER_SUBAGENT = 3
 MAX_CONSULTS = 8
 
 # What a consult step keeps of the question and the reply, for the trace.
 MAX_STEP_TEXT = 700
-
-# Tools that open a file's contents. The router leaves these to the specialist
-# that owns the file's modality.
-_OWNED_TOOLS = ("describe", "fetch", "notes_search")
-_MODALITY_WORDS = {"note": "Notes", "structured": "Tables", "dicom": "Images"}
 
 
 def _consults(session_id: str) -> dict:
@@ -303,74 +258,146 @@ def calls_by(session_id: str, by: str) -> dict[str, dict]:
     }
 
 
-class Conversation:
-    """Messages exchanged with the agent for one piece of work, including tool calls."""
-
-    MAX_STEPS = 16
+class Conversation(ToolLoop):
+    """The harness loop with the server's tools: case reads, and consults."""
 
     def __init__(
         self,
         messages: list[dict],
         session_id: str,
-        client: AgentClient | None = None,
+        client: ModelClient | None = None,
         tools: list[dict] | None = None,
         consult: bool = False,
         max_steps: int | None = None,
         answer_format: Callable[[], dict | None] | None = None,
         activity: str = "Thinking",
         by: str = "router",
+        harness_tool_names: Iterable[str] | None = None,
+        offload: bool | None = None,
+        parent_step: str | None = None,
     ) -> None:
         """The messages so far, plus how tool calls and the answer format work.
 
         ``by`` names who this conversation is with, and so who made its reads.
+        ``harness_tool_names`` are the harness tools it may run (by default all of
+        them for the harness's router, none otherwise). ``offload`` saves payloads
+        to the workspace (by default for the harness's router only).
         """
-        self.messages = messages
+        super().__init__(
+            messages,
+            client or router_client(),
+            list(case.tools if tools is None else tools),
+            max_steps,
+            answer_format,
+            # The harness's own models must be able to read; an external agent
+            # may still answer without tools.
+            tools_required=state.harness,
+        )
         self.session_id = session_id
-        self.client = client or AgentClient.from_env()
-        self.tools = list(case.tools if tools is None else tools)
         self.consult = consult
-        self.max_steps = self.MAX_STEPS if max_steps is None else max_steps
-        self.answer_format = answer_format
         self.activity = activity
         self.by = by
+        self.parent_step = parent_step
+        harness_router = state.harness and by == "router"
 
-    async def reply(self) -> str:
-        """Call the agent until it stops asking for tools, then return its text.
+        if harness_tool_names is None:
+            harness_tool_names = harness_tools().names if harness_router else ()
 
-        Waiting on the model updates the live status. It does not add a row.
+        self.harness_tool_names = set(harness_tool_names)
+        # Only the harness's own models get payloads as workspace paths. An
+        # external agent at --agent-url decodes the base64 it is sent itself.
+        self.offload = harness_router if offload is None else offload
+
+    async def _record(self, step: dict) -> None:
+        """Record one step, tagged with the subagent that made it.
+
+        The page shows a subagent's own reads under its row, so the trace says
+        which party read what.
         """
-        for _ in range(self.max_steps):
-            await set_status(self.session_id, self.activity)
-            message = await self._next()
-            self.messages.append(message)
-            calls = message.get("tool_calls") or []
+        if self.by != "router":
+            step = {**step, "by": self.by, "parent": self.parent_step}
 
-            if not calls:
-                return message.get("content") or ""
+        await record_step(self.session_id, step)
 
-            results = await self._run_calls(calls)
+    async def waiting(self) -> None:
+        """Waiting on the model updates the live status. It does not add a row."""
+        await set_status(self.session_id, self.activity)
 
-            for call, result in zip(calls, results, strict=True):
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id", ""),
-                        "content": json.dumps(result),
-                    }
-                )
+    def prepare_result(self, result: dict) -> object:
+        """Volumes, previews and PDF pages go to the workspace, not the context.
 
-        raise AgentError(f"no answer after {self.max_steps} steps")
+        An image to look at is left out here and sent by ``follow_up``.
+        """
+        if isinstance(result, dict) and "attach_image" in result:
+            result = {
+                key: value for key, value in result.items() if key != "attach_image"
+            }
+
+        if not self.offload:
+            return result
+
+        return offload_payloads(result, workspace_for(self.session_id or "card"))
+
+    def follow_up(self, results: list[dict]) -> list[dict]:
+        """A user message per image the model asked to see.
+
+        Tool messages hold only text in the chat and Responses APIs, so the image
+        comes as the next user turn, named so the model knows where it is from.
+        """
+        messages = []
+
+        for result in results:
+            image = result.get("attach_image") if isinstance(result, dict) else None
+
+            if not isinstance(image, dict):
+                continue
+
+            data_url = f"data:{image['mime_type']};base64,{image['image_base64']}"
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"{result['name']} {image['path']}:"},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            )
+
+        return messages
+
+    def record_usage(self, usage: dict) -> None:
+        """Add one response's tokens to this question's run, under who asked."""
+        run = state.runs.get(self.session_id)
+
+        if run is None:
+            return
+
+        totals = run.setdefault("usage", {}).setdefault(
+            self.by, {"calls": 0, "input": 0, "output": 0, "cached": 0}
+        )
+        totals["calls"] += 1
+
+        for key in ("input", "output", "cached"):
+            totals[key] += int(usage.get(key) or 0)
+
+    def notice(self, text: str) -> None:
+        """Log what the loop reports."""
+        log("server", text)
+
+    async def run_calls(self, calls: list[dict]) -> list[dict]:
+        """Run one turn's tool calls; see ``_run_calls``."""
+        return await self._run_calls(calls)
 
     async def _run_calls(self, calls: list[dict]) -> list[dict]:
         """Run one turn's tool calls and return their results in the same order.
 
-        Consults sent in one turn run at the same time: each waits on its own
-        specialist. The other tools are quick and run one after another.
+        Subagents spawned in one turn run at the same time: each waits on its
+        own model. The other tools are quick and run one after another.
         """
         consults = {
             index: asyncio.ensure_future(self._run_call(call))
             for index, call in enumerate(calls)
-            if str((call.get("function") or {}).get("name", "")).startswith("consult_")
+            if (call.get("function") or {}).get("name") == "spawn_subagent"
         }
         results: list[dict] = []
 
@@ -384,29 +411,6 @@ class Conversation:
             results[index] = await task
 
         return results
-
-    async def _next(self) -> dict:
-        response_format = self.answer_format() if self.answer_format else None
-
-        try:
-            return await asyncio.to_thread(
-                self.client.complete, self.messages, self.tools, response_format
-            )
-        except AgentError as exc:
-            if exc.status not in (400, 422):
-                raise
-
-            if response_format:
-                log("server", "agent refused the answer schema, retrying without it")
-                self.answer_format = None
-                return await self._next()
-
-            if not self.tools:
-                raise
-
-        log("server", "agent refused the tool list, retrying without it")
-        self.tools = []
-        return await asyncio.to_thread(self.client.complete, self.messages, self.tools)
 
     async def _run_call(self, call: dict) -> dict:
         function = call.get("function") or {}
@@ -430,78 +434,86 @@ class Conversation:
                 "message": "Arguments must be a JSON object",
             }
 
-        if name.startswith("consult_"):
-            return await self._consult(name, arguments)
+        if name == "spawn_subagent":
+            return await self._spawn(arguments)
 
-        owner = self._owner(name, arguments)
-
-        if owner:
-            specialist, modality = owner
-            log(
-                "agent",
-                f"session={short_session(self.session_id)} {name} left to "
-                f"consult_{specialist}",
-            )
-            return {
-                "status": "error",
-                "name": name,
-                "message": (
-                    f"{_MODALITY_WORDS.get(modality, 'Those files')} are read by "
-                    f"consult_{specialist}. Ask that specialist and cite the "
-                    "findings it returns by their id."
-                ),
-            }
+        # References and skills read nothing from the case, so they run here
+        # without a cite token. Only the harness's own model is offered them.
+        if name in self.harness_tool_names:
+            return await self._run_harness_tool(name, arguments)
 
         step_id = uuid4().hex[:12]
-        await record_step(self.session_id, {
-            "step_id": step_id,
-            "kind": "tool",
-            "status": "started",
-            "label": _tool_label(name, arguments),
-            "name": name,
-        })
+        await self._record(
+            {
+                "step_id": step_id,
+                "kind": "tool",
+                "status": "started",
+                "label": _tool_label(name, arguments),
+                "name": name,
+            },
+        )
         result = await asyncio.to_thread(
             case.run, name, arguments, self.session_id, self.by
         )
         await self._finish_tool(step_id, name, arguments, result)
         return result
 
-    def _owner(self, name: str, arguments: dict) -> tuple[str, str] | None:
-        """The specialist that reads this file for the router, and its modality.
+    async def _run_harness_tool(self, name: str, arguments: dict) -> dict:
+        """Run one of the harness's tools, shown as a step like any other.
 
-        Only the router is held to this. A specialist that failed on this question
-        no longer owns its files, so the router can still answer from them.
+        A derived tool's output (an exec run) is recorded under a cite token, so
+        a value it printed can be cited and checked.
         """
-        if not self.consult or name not in _OWNED_TOOLS:
-            return None
+        step_id = uuid4().hex[:12]
+        await self._record(
+            {
+                "step_id": step_id,
+                "kind": "tool",
+                "status": "started",
+                "label": _tool_label(name, arguments),
+                "name": name,
+            },
+        )
+        result = await asyncio.to_thread(
+            harness_tools().run,
+            name,
+            arguments,
+            workspace_for(self.session_id or "card"),
+            state.root,
+        )
+        log(
+            "agent",
+            f"session={short_session(self.session_id)} {name} {result['status']}",
+        )
 
-        if name == "notes_search":
-            modality = "note"
-        else:
-            ref = case._file_by_id(arguments.get("resource_id"))
-            modality = str(ref.get("modality") or "") if ref else ""
+        if result["status"] == "ok" and evidence_of(name) is Evidence.DERIVED:
+            token = case.remember_output(
+                self.session_id, name, arguments, result["result"], self.by
+            )
 
-        failed = _consults(self.session_id)["failed"]
+            if token:
+                result = {**result, "cite": token}
 
-        for specialist in state.specialists.values():
-            if modality in specialist.modalities and specialist.name not in failed:
-                return specialist.name, modality
-
-        return None
+        await self._finish_tool(step_id, name, arguments, result)
+        return result
 
     async def _tool_step(self, name: str, arguments: dict, result: dict) -> None:
         """Record a tool call that failed before it ran."""
         step_id = uuid4().hex[:12]
-        await record_step(self.session_id, {
-            "step_id": step_id,
-            "kind": "tool",
-            "status": "started",
-            "label": _tool_label(name, arguments),
-            "name": name,
-        })
+        await self._record(
+            {
+                "step_id": step_id,
+                "kind": "tool",
+                "status": "started",
+                "label": _tool_label(name, arguments),
+                "name": name,
+            },
+        )
         await self._finish_tool(step_id, name, arguments, result)
 
-    async def _finish_tool(self, step_id: str, name: str, arguments: dict, result: dict) -> None:
+    async def _finish_tool(
+        self, step_id: str, name: str, arguments: dict, result: dict
+    ) -> None:
         cite = result.get("cite") if isinstance(result, dict) else None
         label = _tool_label(name, arguments)
 
@@ -516,9 +528,12 @@ class Conversation:
         step = {
             "step_id": step_id,
             "kind": "tool",
-            "status": "error" if not isinstance(result, dict) or result.get("status") == "error" else "done",
+            "status": "error"
+            if not isinstance(result, dict) or result.get("status") == "error"
+            else "done",
             "label": label,
             "name": name,
+            "detail": step_detail(name, arguments, result),
         }
 
         if isinstance(cite, str):
@@ -528,39 +543,53 @@ class Conversation:
             if cite_kind:
                 step["cite_kind"] = cite_kind
 
-        await record_step(self.session_id, step)
+        await self._record(step)
 
-    async def _consult(self, name: str, arguments: dict) -> dict:
-        """Ask one registered specialist.
+    async def _spawn(self, arguments: dict) -> dict:
+        """Run an agent in its own context, within the question's consult budget."""
+        name = "spawn_subagent"
+
+        if not self.consult:
+            return _tool_error(name, "This agent cannot start a subagent.")
+
+        requested = str(arguments.get("agent") or "")
+        agent = offered_agents().get(requested)
+
+        if agent is None:
+            names = ", ".join(offered_agents()) or "none"
+            return _tool_error(name, f"Unknown agent {requested!r}. Agents: {names}")
+
+        async def ask(
+            question: str, context: str, resource_ids: list[str], run_step: str
+        ) -> dict:
+            return await consult_subagent(
+                agent,
+                question,
+                self.session_id,
+                context,
+                resource_ids,
+                parent_step=run_step,
+            )
+
+        return await self._book(agent.name, name, "task", arguments, ask)
+
+    async def _book(
+        self,
+        target: str,
+        name: str,
+        question_field: str,
+        arguments: dict,
+        ask: Callable[[str, str, list[str], str], Awaitable[dict]],
+    ) -> dict:
+        """One subagent run, counted against the question's budget.
 
         The same call made twice gets the first answer. A different question, new
         context, or other resources is a new consult, up to the budget.
         """
-        if not self.consult:
-            return {
-                "status": "error",
-                "name": name,
-                "message": "This agent cannot call another specialist.",
-            }
-
-        specialist_name = name.removeprefix("consult_")
-        specialist = state.specialists.get(specialist_name)
-
-        if specialist is None:
-            return {
-                "status": "error",
-                "name": name,
-                "message": f"Unknown specialist: {specialist_name}",
-            }
-
-        question = arguments.get("question")
+        question = arguments.get(question_field)
 
         if not isinstance(question, str) or not question.strip():
-            return {
-                "status": "error",
-                "name": name,
-                "message": "question must be a non-empty string",
-            }
+            return _tool_error(name, f"{question_field} must be a non-empty string")
 
         raw_context = arguments.get("context")
         context = raw_context.strip() if isinstance(raw_context, str) else ""
@@ -572,7 +601,7 @@ class Conversation:
         ]
         book = _consults(self.session_id)
         key = (
-            specialist_name,
+            target,
             " ".join(question.lower().split()),
             " ".join(context.lower().split()),
             tuple(resource_ids),
@@ -583,74 +612,177 @@ class Conversation:
             log(
                 "agent",
                 f"session={short_session(self.session_id)} "
-                f"consult {specialist_name} already asked that",
+                f"consult {target} already asked that",
             )
             earlier: dict = await asked
             return earlier
 
-        used = book["count"].get(specialist_name, 0)
+        used = book["count"].get(target, 0)
 
-        if used >= MAX_CONSULTS_PER_SPECIALIST or len(book["tasks"]) >= MAX_CONSULTS:
-            return {
-                "status": "error",
-                "name": name,
-                "message": (
-                    f"The consult budget for this question is used "
-                    f"({used} to {specialist_name}, {len(book['tasks'])} in all). "
-                    "Answer from what the specialists returned."
-                ),
-            }
+        if used >= MAX_CONSULTS_PER_SUBAGENT or len(book["tasks"]) >= MAX_CONSULTS:
+            return _tool_error(
+                name,
+                f"The consult budget for this question is used "
+                f"({used} to {target}, {len(book['tasks'])} in all). "
+                "Answer from what the subagents returned.",
+            )
 
-        book["count"][specialist_name] = used + 1
+        book["count"][target] = used + 1
         task = asyncio.ensure_future(
-            self._ask(specialist, question.strip(), context, resource_ids)
+            self._ask(target, question.strip(), context, resource_ids, ask)
         )
         book["tasks"][key] = task
         return await task
 
     async def _ask(
         self,
-        specialist: Specialist,
+        target: str,
         question: str,
         context: str,
         resource_ids: list[str],
+        ask: Callable[[str, str, list[str], str], Awaitable[dict]],
     ) -> dict:
-        """One consult, shown as a step with what was asked and what came back."""
+        """One subagent run, shown as a step with its task and what came back."""
         step_id = uuid4().hex[:12]
-        label = f"Consulting {specialist.name}"
-        await record_step(self.session_id, {
-            "step_id": step_id,
-            "kind": "consult",
-            "status": "started",
-            "label": label,
-            "name": specialist.name,
-            "question": question[:MAX_STEP_TEXT],
-            "context": context[:MAX_STEP_TEXT] or None,
-        })
-        result = await consult_specialist(
-            specialist, question, self.session_id, context, resource_ids
+        label = f"Subagent {target}"
+        await self._record(
+            {
+                "step_id": step_id,
+                "kind": "subagent",
+                "status": "started",
+                "label": label,
+                "name": target,
+                "question": question[:MAX_STEP_TEXT],
+                "context": context[:MAX_STEP_TEXT] or None,
+            },
         )
+        result = await ask(question, context, resource_ids, step_id)
         failed = result.get("status") == "error"
 
         if failed:
-            _consults(self.session_id)["failed"].add(specialist.name)
+            _consults(self.session_id)["failed"].add(target)
 
-        await record_step(self.session_id, {
-            "step_id": step_id,
-            "kind": "consult",
-            "status": "error" if failed else "done",
-            "label": label,
-            "name": specialist.name,
-            "reply": _reply_preview(result),
-            "findings": len(result.get("findings") or []) or None,
-            "needs": [item["what"] for item in result.get("needs") or []] or None,
-            "abstentions": result.get("abstentions") or None,
-        })
+        await self._record(
+            {
+                "step_id": step_id,
+                "kind": "subagent",
+                "status": "error" if failed else "done",
+                "label": label,
+                "name": target,
+                "reply": _reply_preview(result),
+                "findings": len(result.get("findings") or []) or None,
+                "needs": [item["what"] for item in result.get("needs") or []] or None,
+                "abstentions": result.get("abstentions") or None,
+            },
+        )
         return result
 
 
+MAX_DETAIL = 160
+
+
+def _clip(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= MAX_DETAIL else text[: MAX_DETAIL - 1] + "…"
+
+
+def step_detail(name: str, arguments: dict, result: object) -> str | None:
+    """One line on what a tool call did, or why it failed, for the trace."""
+    if not isinstance(result, dict):
+        return None
+
+    if result.get("status") == "error":
+        return _clip(f"failed: {result.get('message') or 'no reason given'}")
+
+    raw = result.get("result")
+    payload = raw if isinstance(raw, dict) else {}
+
+    if name in ("fetch", "describe"):
+        parts = [str(arguments["view"])] if arguments.get("view") else []
+
+        if arguments.get("roi"):
+            parts.append(f"roi {arguments['roi']}")
+
+        spacing = arguments.get("spacing")
+        if isinstance(spacing, list) and spacing:
+            parts.append("×".join(str(value) for value in spacing) + " mm")
+
+        if arguments.get("slice_index") is not None:
+            parts.append(f"slice {arguments['slice_index']}")
+
+        for key in ("item", "name", "at"):
+            if arguments.get(key):
+                parts.append(f"{key} {arguments[key]}")
+
+        return _clip(" · ".join(parts)) if parts else None
+
+    if name == "exec":
+        # The command is usually "write a script, then run it": show the run.
+        lines = [
+            line.strip()
+            for line in str(arguments.get("command") or "").splitlines()
+            if line.strip()
+        ]
+        runs = [line for line in lines if line.startswith(("python", "bash", "sh "))]
+        ran = runs[-1] if runs else (lines[-1] if lines else "exec")
+        printed = [
+            line.strip()
+            for line in str(payload.get("stdout") or "").splitlines()
+            if line.strip()
+        ]
+        detail = f"{ran} → {printed[-1]}" if printed else ran
+
+        if payload.get("exit_code") not in (0, None):
+            detail += f" (exit {payload['exit_code']})"
+
+        return _clip(detail)
+
+    if name == "view_image":
+        return _clip(str(arguments.get("path") or ""))
+
+    if name.startswith("mcp__"):
+        # The arguments that name files or settings, then the first line back.
+        shown = " · ".join(
+            f"{key} {value}"
+            for key, value in arguments.items()
+            if isinstance(value, str | int | float) and not isinstance(value, bool)
+        )
+        returned = mcp_summary(payload)
+        return _clip(f"{shown} → {returned}" if returned else shown) or None
+
+    if name == "load_skill":
+        return _clip(str(arguments.get("name") or ""))
+
+    if name in ("notes_search", "reference_search"):
+        return _clip(f"“{arguments.get('query') or ''}”")
+
+    if name == "reference_read":
+        return _clip(str(payload.get("title") or arguments.get("url") or ""))
+
+    if name == "ledger_query":
+        filters = [
+            str(arguments[key])
+            for key in ("category", "attribute", "text", "note_id")
+            if arguments.get(key)
+        ]
+        found = len(payload.get("facts") or [])
+        return _clip(f"{' · '.join(filters) or 'all'} → {found} facts")
+
+    if name == "notes_timeline":
+        return _clip(f"{len(payload.get('events') or [])} events")
+
+    if name == "notes_conflicts":
+        return _clip(f"{len(payload.get('conflicts') or [])} disagreements")
+
+    return None
+
+
+def _tool_error(name: str, message: str) -> dict:
+    return {"status": "error", "name": name, "message": message}
+
+
 def _reply_preview(result: dict) -> str:
-    """The specialist's words, without its citation objects, for the trace."""
+    """The subagent's words, without its citation objects, for the trace."""
     if result.get("status") == "error":
         return str(result.get("message") or "")[:MAX_STEP_TEXT]
 
@@ -667,13 +799,77 @@ def _reply_preview(result: dict) -> str:
     return text[:MAX_STEP_TEXT]
 
 
+_harness_tools: HarnessTools | None = None
+
+
+def harness_tools() -> HarnessTools:
+    """The harness's own tools, built on first use and kept for the process."""
+    global _harness_tools
+
+    if _harness_tools is None:
+        # Reference URLs are screened for this patient's identifiers.
+        _harness_tools = HarnessTools(outbound=OutboundScreen(case.identifiers))
+
+        for warning in _harness_tools.warnings:
+            log("server", warning)
+
+    return _harness_tools
+
+
+_agents: dict[str, Agent] | None = None
+
+
+def offered_agents() -> dict[str, Agent]:
+    """Agents the harness router may spawn, built on first use.
+
+    Each file in ``agents/``, unless ``[agent.<name>]`` sets ``enabled = false``.
+    """
+    global _agents
+
+    if _agents is None:
+        harness = harness_tools()
+        warnings: list[str] = []
+        _agents = load_agents(
+            AGENTS_DIR,
+            harness.skills,
+            harness.mcp.servers,
+            on_warning=warnings.append,
+        )
+        harness.agents = _agents
+
+        for warning in warnings:
+            log("server", warning)
+
+    return _agents
+
+
 def router_tools() -> list[dict]:
-    """Datactrl tools, plus one consult tool per registered specialist."""
-    return [*case.tools, *(spec.tool() for spec in state.specialists.values())]
+    """Datactrl tools, plus the harness's own tools with --harness.
+
+    An external agent at --agent-url gets the datactrl tools only.
+    """
+    tools = list(case.tools)
+
+    if state.harness:
+        harness = harness_tools()
+        tools += harness.definitions()
+        agents = offered_agents()
+
+        if agents:
+            tools.append(
+                spawn_tool(
+                    agents,
+                    harness.mcp.tools,
+                    sandbox=harness.sandbox_problem is None,
+                )
+            )
+
+    return tools
 
 
-def _client_for(url: str) -> AgentClient:
-    return AgentClient(
+def _agent_client(url: str) -> ChatCompletionsClient:
+    """The external agent at --agent-url, spoken to over chat completions."""
+    return ChatCompletionsClient(
         url,
         os.getenv("AGENT_MODEL", ""),
         os.getenv("AGENT_API_KEY"),
@@ -681,14 +877,14 @@ def _client_for(url: str) -> AgentClient:
     )
 
 
-# The lines a consult adds below the question. A specialist that wants them
+# The lines a subagent run adds below the task. A subagent that wants them
 # splits the message on these; one that does not reads them as part of the text.
-CONTEXT_HEADING = "Context from other specialists:"
+CONTEXT_HEADING = "Context from other findings:"
 RESOURCES_HEADING = "Use these resources:"
 
 
-def specialist_request(question: str, context: str, resource_ids: list[str]) -> str:
-    """The user message a specialist gets: the question, then context and files."""
+def subagent_request(question: str, context: str, resource_ids: list[str]) -> str:
+    """The user message a subagent gets: the task, then context and files."""
     parts = [question]
 
     if context:
@@ -700,17 +896,17 @@ def specialist_request(question: str, context: str, resource_ids: list[str]) -> 
     return "\n\n".join(parts)
 
 
-def specialist_instructions() -> str:
-    """Prompt for a specialist: cite case files, and do not call other agents."""
+def subagent_instructions() -> str:
+    """Prompt for a subagent: cite case files, and do not start other agents."""
     return "\n".join(
         [
-            "You are a specialist answering one question about one patient's medical "
+            "You are a subagent answering one question about one patient's medical "
             "files. "
             "Use the tools to read the files when you need them. "
             "Ground your answer in the files. "
-            "Do not call another specialist.",
+            "Do not start another subagent.",
             f"Citation rule: {Contract.specialist_rule()}",
-            f"Answer schema, with examples: {answer.prompt_schema()}",
+            f"Answer schema, with examples: {schema.prompt_schema()}",
             "Beside response and citations, the JSON may carry: abstentions, a list "
             "of what your files do not say; needs, a list of what you lack to "
             'answer, each {"what": ..., "why": ...}; and facts, the keyed values '
@@ -718,37 +914,79 @@ def specialist_instructions() -> str:
             '"unit": ..., "date": "YYYY-MM-DD", "cite": the marker it belongs to}. '
             "A reply with needs or abstentions and nothing to cite has an empty "
             "citations list.",
-            f"Case resources: {json.dumps(case.files())}",
+            resources_line(),
         ]
     )
 
 
-async def consult_specialist(
-    specialist: Specialist,
+async def consult_subagent(
+    agent: Agent,
     question: str,
     session_id: str,
     context: str = "",
     resource_ids: list[str] | None = None,
+    parent_step: str | None = None,
 ) -> dict:
-    """Ask one specialist, then return its findings or a tool error. Never raises."""
-    label = short_session(session_id)
-    name = f"consult_{specialist.name}"
-    log("server", f"session={label} consult {specialist.name}: {question}")
+    """Run an agent in a fresh context. Never raises.
+
+    ``parent_step`` is the step id of this run, which the agent's own steps
+    carry so the page can group them under it.
+
+    The system prompt is the subagent rules, then the agent's body, then each
+    skill it lists. It is offered the case and harness tools plus connected
+    MCP tools, filtered by its grant. A granted tool that is not available is
+    left out. Its reply is checked and kept as findings, exactly as the
+    router's own answer is. Finding ids are ``<agent>.<n>``, such as ``dicom.1``.
+    """
+    name = f"consult_{agent.name}"
+    log(
+        "server",
+        f"session={short_session(session_id)} subagent {agent.name}: {question}",
+    )
+
+    try:
+        client = agent.client()
+    except ValueError as exc:
+        return _tool_error(name, str(exc))
+
+    harness = harness_tools()
+    mcp_definitions = harness.mcp.definitions_for(set(agent.tools))
+    own = harness.own_definitions()
+    tools = offered_tools(agent.tools, case.tools, own, mcp_definitions)
+    own_names = {item["function"]["name"] for item in own}
+    offered_names = {item["function"]["name"] for item in tools}
     conversation = Conversation(
         [
-            {"role": "system", "content": specialist_instructions()},
+            {
+                "role": "system",
+                "content": agent.system_prompt(subagent_instructions(), harness.skills),
+            },
             {
                 "role": "user",
-                "content": specialist_request(question, context, resource_ids or []),
+                "content": subagent_request(question, context, resource_ids or []),
             },
         ],
         session_id,
-        client=_client_for(specialist.url),
-        tools=list(case.tools),
+        client=client,
+        tools=tools,
         consult=False,
-        activity=f"Waiting for {specialist.name}",
-        by=specialist.name,
+        max_steps=agent.max_steps,
+        activity=f"Waiting for {agent.name}",
+        by=agent.name,
+        harness_tool_names=offered_names & own_names,
+        offload=True,
+        parent_step=parent_step,
     )
+    return await run_consult(agent.name, conversation, session_id)
+
+
+async def run_consult(name: str, conversation: Conversation, session_id: str) -> dict:
+    """Send refused replies back until one passes, then keep it as findings.
+
+    Never raises.
+    """
+    label = short_session(session_id)
+    tool_name = f"consult_{name}"
     problem = ""
 
     try:
@@ -760,21 +998,16 @@ async def consult_specialist(
                 problem = "The reply was empty."
                 verdict = None
             else:
-                verdict = Answer(
-                    text, [], case.files(), calls_by(session_id, specialist.name)
-                )
+                verdict = Answer(text, [], case.files(), calls_by(session_id, name))
                 problem = verdict.problem or ""
 
             if verdict is not None and verdict.problem is None:
-                log("agent", f"session={label} consult {specialist.name} ok")
-                return findings.accept(
-                    session_id, specialist.name, reply, text, verdict
-                )
+                log("agent", f"session={label} consult {name} ok")
+                return findings.accept(session_id, name, reply, text, verdict)
 
             log(
                 "agent",
-                f"session={label} consult {specialist.name} "
-                f"reply {attempt} refused: {problem}",
+                f"session={label} consult {name} reply {attempt} refused: {problem}",
             )
             correction = (
                 verdict.correction()
@@ -786,16 +1019,13 @@ async def consult_specialist(
                 {"role": "user", "content": correction},
             ]
     except Exception as exc:
-        log("agent", f"session={label} consult {specialist.name} failed: {exc}")
-        return {"status": "error", "name": name, "message": str(exc)}
+        log("agent", f"session={label} consult {name} failed: {exc}")
+        return _tool_error(tool_name, str(exc))
 
-    return {
-        "status": "error",
-        "name": name,
-        "message": (
-            f"The specialist could not produce valid citations. Last problem: {problem}"
-        ),
-    }
+    return _tool_error(
+        tool_name,
+        f"The subagent could not produce valid citations. Last problem: {problem}",
+    )
 
 
 class Question:
@@ -842,7 +1072,7 @@ class Question:
             + [{"role": turn["role"], "content": turn["content"]} for turn in history],
             self.session_id,
             tools=router_tools(),
-            consult=bool(state.specialists),
+            consult=self._has_subagents(),
             answer_format=self._answer_format,
         )
         problem = ""
@@ -902,56 +1132,46 @@ class Question:
             state.consults.pop(self.session_id, None)
             state.findings.pop(self.session_id, None)
 
+    @staticmethod
+    def _has_subagents() -> bool:
+        return state.harness and bool(offered_agents())
+
     def _answer_format(self) -> dict | None:
         """The answer schema, once a read or a finding means the reply must be cited."""
         cited = calls_by(self.session_id, "router") or state.findings.get(
             self.session_id
         )
-        return answer.response_format() if cited else None
+        return schema.response_format() if cited else None
 
     def _instructions(self) -> str:
         lines = [
             self.PROMPT,
             f"Citation rule: {Contract.RULE}",
-            f"Answer schema, with examples: {answer.prompt_schema()}",
-            f"Case resources: {json.dumps(case.files())}",
+            f"Answer schema, with examples: {schema.prompt_schema()}",
+            resources_line(),
         ]
 
-        if state.specialists:
-            roster = "; ".join(
-                f"consult_{name}: {spec.description}"
-                for name, spec in state.specialists.items()
+        if state.harness:
+            lines.append(harness_tools().prompt())
+            offered = [tool["function"]["name"] for tool in router_tools()]
+            lines.append(citing_rule(offered))
+
+        if self._has_subagents():
+            lines.append(
+                "Launch an agent when it has tools you do not (segmentation "
+                "models, code execution for its domain), or when the work means "
+                "many reads of one kind. Do the work yourself when it is a quick "
+                "lookup your own tools can finish. Launch several agents in the "
+                "same turn when a question spans areas; they run in parallel. "
+                "Use load_skill for guidance you can follow with your own tools."
             )
             lines.append(
-                "Specialists: " + roster + ". "
-                "Call consult_<name> with the part of the question that specialist "
-                "answers. Calls made in one turn run at the same time. "
-                "A specialist's reply lists findings, each with an id such as "
-                "notes.1. Cite a finding by putting [cite:notes.1] right after the "
-                "words it supports. Do not copy its citation: the server attaches "
-                "the checked one, and citations then lists only files you read "
-                "yourself. "
-                "needs lists what a specialist lacks to answer. Get it from another "
-                "specialist, then ask the first one again with that as context. "
-                "abstentions lists what its files do not say. "
-                f"A specialist can be asked up to {MAX_CONSULTS_PER_SPECIALIST} "
-                "times, with a new question, with context, or with resource_ids "
-                "naming the files to use. "
-                "If a specialist returns an error, say so and answer from the others."
+                "spawn_subagent returns findings, each with an id such as "
+                "dicom.1. Cite a finding by putting [cite:dicom.1] right after "
+                "the words it supports; do not copy its citation. needs lists "
+                "what it lacks, and abstentions what its files do not say. Each "
+                f"agent can be asked up to {MAX_CONSULTS_PER_SUBAGENT} times."
             )
-
-            owned = "; ".join(
-                f"{_MODALITY_WORDS.get(modality, modality).lower()} through "
-                f"consult_{spec.name}"
-                for spec in state.specialists.values()
-                for modality in spec.modalities
-            )
-
-            if owned:
-                lines.append(
-                    f"Read {owned}, not with describe or fetch. "
-                    "Those tools answer with an error for such a file."
-                )
 
         return "\n".join(lines)
 
@@ -980,7 +1200,8 @@ class Question:
         session.steps = []
         session.status = ""
         session.started = None
-        session.add("assistant", message, steps, duration_ms)
+        usage = (state.runs.get(self.session_id) or {}).get("usage")
+        session.add("assistant", message, steps, duration_ms, usage=usage)
         session.processing = False
 
         run = state.runs.pop(self.session_id, None)
@@ -1047,9 +1268,7 @@ class PatientCard:
             [
                 {
                     "role": "system",
-                    "content": (
-                        f"{self.PROMPT}\nCase resources: {json.dumps(case.files())}"
-                    ),
+                    "content": (f"{self.PROMPT}\n{resources_line()}"),
                 },
                 {"role": "user", "content": "Fill in the patient card."},
             ],
@@ -1077,7 +1296,9 @@ class PatientCard:
 
 
 def _audit_outcome(message: str) -> str:
-    if message.startswith("The agent could not") or message.startswith("The agent failed"):
+    if message.startswith("The agent could not") or message.startswith(
+        "The agent failed"
+    ):
         return "failure"
     return "success"
 
@@ -1085,6 +1306,91 @@ def _audit_outcome(message: str) -> str:
 def ask(session_id: str) -> None:
     """Answer the latest question in this session in the background."""
     Question(session_id).start()
+
+
+def start_indexes() -> None:
+    """In harness mode, connect the MCP servers and start the notes ledger.
+
+    Building the ledger calls the notes model once per new or changed note (the
+    ledger is cached), so HARNESS_LEDGER=off skips it.
+    """
+    if not state.harness or state.root is None:
+        return
+
+    start_mcp()
+
+    if os.getenv("HARNESS_LEDGER", "on").strip().lower() == "off":
+        log("server", "notes ledger: off (HARNESS_LEDGER=off)")
+        return
+
+    if state.datactrl_case is None:
+        state.datactrl_case = DatactrlCase.open(state.root)
+
+    ledger = harness_tools().ledger
+    ledger.on_done = lambda status: log("server", f"notes ledger: {status}")
+    ledger.start(state.datactrl_case, state.root.name)
+    log("server", f"notes ledger: {ledger.status} ({ledger.note_count} notes)")
+
+
+def start_mcp() -> None:
+    """Connect the configured MCP servers in the background, then log each status.
+
+    A container server can take a while to start (TotalSegmentator loads torch),
+    so the page does not wait: its tools join once it has connected, and
+    /api/health shows each server's status meanwhile.
+    """
+    hub = harness_tools().mcp
+
+    if not hub.servers:
+        return
+
+    def connect() -> None:
+        hub.start()
+
+        for name, status in hub.status.items():
+            log("server", f"mcp {name}: {status}")
+
+    threading.Thread(target=connect, name="mcp-start", daemon=True).start()
+
+
+def mcp_status() -> dict[str, str]:
+    """Each configured MCP server's status, for /api/health."""
+    if not state.harness or _harness_tools is None:
+        return {}
+
+    return dict(_harness_tools.mcp.status)
+
+
+def stop_indexes() -> None:
+    """Close the MCP servers' connections, at shutdown."""
+    if _harness_tools is not None:
+        _harness_tools.mcp.stop()
+
+
+# A case with more DICOM series than this lists them by count in the harness
+# prompt: TCGA-DD-A4NF's 50 series cost about 13k tokens on every call.
+MAX_LISTED_DICOM = 10
+
+
+def resources_line() -> str:
+    """The system prompt's list of case files.
+
+    In harness mode a long run of DICOM series is summarised, since the model
+    gets their ids from dicom_groups or dicom_tree anyway. An external agent at
+    --agent-url gets the full list.
+    """
+    files = case.files()
+    dicom = [item for item in files if item.get("modality") == "dicom"]
+
+    if not state.harness or len(dicom) <= MAX_LISTED_DICOM:
+        return f"Case resources: {json.dumps(files)}"
+
+    listed = [item for item in files if item.get("modality") != "dicom"]
+    return (
+        f"Case resources: {json.dumps(listed)}\n"
+        f"DICOM: {len(dicom)} series, not listed above. dicom_groups or dicom_tree "
+        "gives their resource ids."
+    )
 
 
 def fill_card() -> None:

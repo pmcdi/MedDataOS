@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,9 +63,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_patient ON audit_runs(patient_id, started_a
 
 
 def case_dir(root: Path) -> Path:
-    """Folder under data/cases for this case path."""
+    """Folder for this case path under MEDDATAOS_STORE (default data/cases)."""
     digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
-    return APP_ROOT / "data" / "cases" / digest
+    store = os.getenv("MEDDATAOS_STORE") or str(APP_ROOT / "data" / "cases")
+    return Path(store).expanduser() / digest
 
 
 def db_path(root: Path) -> Path:
@@ -108,10 +110,13 @@ def _migrate_json(root: Path) -> None:
     if not isinstance(payload, dict):
         return
 
-    sessions = payload.get("sessions") if isinstance(payload.get("sessions"), dict) else {}
-    pins = payload.get("pins") if isinstance(payload.get("pins"), dict) else {}
-    reviews = payload.get("reviews") if isinstance(payload.get("reviews"), dict) else {}
-    found = sessions_from_store(sessions)
+    def table(key: str) -> dict:
+        """One part of the legacy file, or nothing when it is not an object."""
+        value = payload.get(key)
+        return value if isinstance(value, dict) else {}
+
+    pins, reviews = table("pins"), table("reviews")
+    found = sessions_from_store(table("sessions"))
 
     save(root, found, pins, reviews)
     backup = legacy.with_suffix(".json.bak")
@@ -139,7 +144,8 @@ def load(root: Path) -> dict:
                     "uploaded_file": row["uploaded_file"],
                 }
                 for row in connection.execute(
-                    "SELECT session_id, patient_id, history, uploaded_file FROM sessions"
+                    "SELECT session_id, patient_id, history, uploaded_file "
+                    "FROM sessions"
                 )
             }
             pins: dict[str, list] = {}
@@ -153,8 +159,8 @@ def load(root: Path) -> dict:
             for row in connection.execute(
                 "SELECT patient_id, review_key, checklist_state FROM reviews"
             ):
-                reviews.setdefault(row["patient_id"], {})[row["review_key"]] = json.loads(
-                    row["checklist_state"]
+                reviews.setdefault(row["patient_id"], {})[row["review_key"]] = (
+                    json.loads(row["checklist_state"])
                 )
     except (OSError, sqlite3.Error, json.JSONDecodeError) as exc:
         log("server", f"could not read case store {db_path(root)}: {exc}")
@@ -327,21 +333,23 @@ def list_audit_runs(
     runs = []
 
     for row in rows:
-        runs.append({
-            "run_id": row["run_id"],
-            "session_id": row["session_id"],
-            "patient_id": row["patient_id"],
-            "question": row["question"],
-            "started_at": row["started_at"],
-            "finished_at": row["finished_at"],
-            "duration_ms": row["duration_ms"],
-            "outcome": row["outcome"],
-            "steps": json.loads(row["steps"]),
-            "calls": json.loads(row["calls"]),
-            "refusals": json.loads(row["refusals"]),
-            "answer": row["answer"],
-            "citations": json.loads(row["citations"]),
-        })
+        runs.append(
+            {
+                "run_id": row["run_id"],
+                "session_id": row["session_id"],
+                "patient_id": row["patient_id"],
+                "question": row["question"],
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "duration_ms": row["duration_ms"],
+                "outcome": row["outcome"],
+                "steps": json.loads(row["steps"]),
+                "calls": json.loads(row["calls"]),
+                "refusals": json.loads(row["refusals"]),
+                "answer": row["answer"],
+                "citations": json.loads(row["citations"]),
+            }
+        )
 
     return runs
 
@@ -354,14 +362,16 @@ def calls_for_audit(calls: dict[str, dict]) -> list[dict]:
         if not isinstance(record, dict):
             continue
 
-        found.append({
-            "cite": token,
-            "tool": record.get("tool"),
-            "web_path": record.get("web_path"),
-            "modality": record.get("modality"),
-            "file": record.get("file"),
-            "by": record.get("by", "router"),
-        })
+        found.append(
+            {
+                "cite": token,
+                "tool": record.get("tool"),
+                "web_path": record.get("web_path"),
+                "modality": record.get("modality"),
+                "file": record.get("file"),
+                "by": record.get("by", "router"),
+            }
+        )
 
     return found
 
@@ -384,14 +394,22 @@ def citations_for_audit(message: str) -> list[dict]:
         if not isinstance(item, dict):
             continue
 
-        kept.append({
-            key: item[key]
-            for key in (
-                "cite", "id", "kind", "web_path", "summary", "agent", "inputs",
-                "finding", "basis",
-            )
-            if key in item
-        })
+        kept.append(
+            {
+                key: item[key]
+                for key in (
+                    "cite",
+                    "id",
+                    "kind",
+                    "web_path",
+                    "summary",
+                    "agent",
+                    "inputs",
+                    "finding",
+                    "basis",
+                )
+                if key in item
+            }
+        )
 
     return kept
-

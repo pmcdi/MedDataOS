@@ -3187,7 +3187,7 @@ main {
     margin: 2px 0 0 19px;
 }
 .step-summary,
-.step-trace summary,
+.step-trace > summary,
 .step-trace-plain {
     font-family: var(--mono);
     font-size: 11px;
@@ -3197,21 +3197,22 @@ main {
 .step-summary:empty {
     display: none;
 }
+/* Only the trace's own header: a subagent row inside is a summary too. */
 .step-trace {
     min-width: 17rem;
     margin-bottom: 10px;
 }
-.step-trace summary {
+.step-trace > summary {
     cursor: pointer;
     list-style: none;
     display: flex;
     align-items: center;
     gap: 6px;
 }
-.step-trace summary::-webkit-details-marker {
+.step-trace > summary::-webkit-details-marker {
     display: none;
 }
-.step-trace summary::before {
+.step-trace > summary::before {
     content: '';
     width: 5px;
     height: 5px;
@@ -3221,10 +3222,10 @@ main {
     transition: transform 0.15s ease;
     margin-right: 2px;
 }
-.step-trace[open] summary::before {
+.step-trace[open] > summary::before {
     transform: rotate(45deg);
 }
-.step-trace summary:hover {
+.step-trace > summary:hover {
     color: var(--text-primary);
 }
 .step-list {
@@ -3313,6 +3314,70 @@ main {
 }
 .step-error .step-label {
     color: var(--critical);
+}
+/* What a step did, under its label: the view read, what exec printed. */
+.step-note {
+    grid-column: 3 / -1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    color: var(--text-dim);
+}
+.step-error .step-note {
+    color: var(--critical);
+}
+
+/* A subagent run: a header row that opens onto its task, steps and reply. */
+.step-subagent .step-label {
+    color: var(--accent);
+    font-weight: 600;
+}
+.step-group {
+    list-style: none;
+}
+.step-group > details > summary {
+    list-style: none;
+    cursor: pointer;
+}
+.step-group > details > summary::-webkit-details-marker {
+    display: none;
+}
+.step-group > details > summary .step-kind::after {
+    content: ' ▸';
+}
+.step-group > details[open] > summary .step-kind::after {
+    content: ' ▾';
+}
+.run-body {
+    margin: 2px 0 6px 19px;
+    padding-left: 10px;
+    border-left: 1px solid var(--border);
+}
+.run-line {
+    font-family: var(--mono);
+    display: grid;
+    grid-template-columns: 4.4rem minmax(0, 1fr);
+    column-gap: 8px;
+    margin: 3px 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+}
+.run-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+}
+.run-failed .run-text {
+    color: var(--critical);
+}
+.run-steps {
+    margin: 2px 0;
+    padding: 0;
 }
 .step-cite {
     color: var(--text-dim);

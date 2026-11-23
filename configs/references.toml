@@ -1,0 +1,19 @@
+# Reference sites the harness may search and read.
+#
+# name       label the agent uses with reference_search(site=...)
+# base_url   pages are only fetched from this host
+# sitemap    optional sitemap.xml; without one the home page and the pages it
+#            links to (max_depth levels; 0 = home page only) are crawled to build the index
+# query_params  optional list of query parameters this site's pages need, such as
+#            ["page"]; every other parameter is dropped before a fetch
+#
+# Redirects are followed only while they stay on a listed site, and a URL holding
+# the patient's identifiers or a full date is refused before it is fetched.
+#
+# The index is cached under $HARNESS_CACHE/references (default .cache/harness) for 7 days.
+# Delete that folder to rebuild it after changing this file.
+
+[[site]]
+name = "radiologyassistant"
+base_url = "https://radiologyassistant.nl/"
+max_depth = 0

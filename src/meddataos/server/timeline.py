@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from meddataos.datactrl.case import Case
-from meddataos.datactrl.limits import MAX_TABLE_LIMIT
-from meddataos.datactrl.utils.table import is_null, parse_when
-from meddataos.server.case import web_path
+from meddataos.core.datactrl.case import Case
+from meddataos.core.datactrl.limits import MAX_TABLE_LIMIT
+from meddataos.core.datactrl.utils.table import is_null, parse_when
+from meddataos.core.verifier.paths import web_path
 
 MAX_EVENTS_PER_LANE = 400
 

@@ -19,7 +19,6 @@ from pathlib import Path
 import pytest
 from websockets.sync.client import connect
 
-
 APP = Path(__file__).resolve().parents[2]
 
 
@@ -33,7 +32,9 @@ def _free_port() -> int:
 def case_folder(tmp_path_factory) -> Path:
     folder = tmp_path_factory.mktemp("cases") / "P0042"
     folder.mkdir()
-    (folder / "clinic_note.txt").write_text("Chief complaint: fatigue.\nPlan: follow-up in 2 weeks.\n")
+    (folder / "clinic_note.txt").write_text(
+        "Chief complaint: fatigue.\nPlan: follow-up in 2 weeks.\n"
+    )
     (folder / "labs.csv").write_text("test,value\nhemoglobin,13.1\nwbc,6.2\n")
     return folder
 
@@ -42,27 +43,42 @@ def case_folder(tmp_path_factory) -> Path:
 def running_server(
     case_folder,
     agent_url="http://127.0.0.1:9/v1",
-    specialists=None,
-    agents_file=None,
+    harness=False,
+    scratch=None,
     **settings,
 ):
     port = _free_port()
     env = {key: value for key, value in os.environ.items() if key != "AGENT_URL"}
-    env.update(HOST="127.0.0.1", PORT=str(port), **settings)
-    command = [
-        sys.executable,
-        "-m",
-        "meddataos.server",
-        str(case_folder),
-        "--agent-url",
-        agent_url,
-    ]
-
-    if agents_file:
-        command.extend(["--agents", agents_file])
-
-    for specialist in specialists or []:
-        command.extend(["--specialist", specialist])
+    # Chats and pins are stored beside the case folder, inside pytest's own
+    # temporary tree, so nothing from an earlier run is found again.
+    # ``scratch`` keeps the store, cache and config out of a real case's folder.
+    scratch = Path(scratch) if scratch is not None else Path(case_folder).parent
+    store = str(scratch / "store")
+    # No developer config: configs/harness.toml would start real MCP servers.
+    empty_config = scratch / "harness.toml"
+    empty_config.touch()
+    # MCP registrations stay empty: these files are not created. A grant to a
+    # server that is not registered is a startup warning, not a failure.
+    # A test that passes HARNESS_MCP_PROJECT replaces the path.
+    env.update(
+        HOST="127.0.0.1",
+        PORT=str(port),
+        MEDDATAOS_STORE=store,
+        HARNESS_CONFIG=str(empty_config),
+        HARNESS_CACHE=str(scratch / "cache"),
+        # Not the developer's registrations: configs/mcp.json and ~/.meddataos.
+        HARNESS_MCP_USER=str(scratch / "mcp-user.json"),
+        HARNESS_MCP_PROJECT=str(scratch / "mcp-project.json"),
+        HARNESS_MCP_LOCAL=str(scratch / "mcp-local.json"),
+    )
+    env.update(settings)
+    command = [sys.executable, "-m", "meddataos.server", str(case_folder)]
+    # True passes --harness, None passes no flag (the harness is the default),
+    # and False points the server at the agent URL.
+    if harness:
+        command.append("--harness")
+    elif harness is False:
+        command.extend(["--agent-url", agent_url])
 
     process = subprocess.Popen(
         command,
@@ -113,7 +129,9 @@ def post(server, path, body):
 
 
 def send_chat(server, message, patient_id="P0042"):
-    form = urllib.parse.urlencode({"message": message, "patient_id": patient_id}).encode()
+    form = urllib.parse.urlencode(
+        {"message": message, "patient_id": patient_id}
+    ).encode()
 
     with urllib.request.urlopen(server["http"] + "/api/chat", data=form) as response:
         return json.load(response)
@@ -225,23 +243,15 @@ def test_case_files_are_served(server):
         assert b"fatigue" in response.read()
 
 
-def test_server_requires_an_agent_url(case_folder):
-    result = subprocess.run(
-        [sys.executable, "-m", "meddataos.server", str(case_folder)],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-
-    assert result.returncode != 0
-    assert "--agent-url" in result.stderr
-
-
 def test_example_agent_requires_a_model():
     env = {key: value for key, value in os.environ.items() if key != "OPENAI_MODEL"}
     env["OPENAI_MODEL"] = ""
 
-    for key in ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT"):
+    for key in (
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_DEPLOYMENT",
+    ):
         env[key] = ""
 
     result = subprocess.run(
@@ -263,9 +273,13 @@ def test_example_agent_forwards_chat_completions():
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             RecordingModel.requests.append(body)
-            data = json.dumps({
-                "choices": [{"message": {"role": "assistant", "content": "Plain answer."}}],
-            }).encode()
+            data = json.dumps(
+                {
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "Plain answer."}}
+                    ],
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -300,12 +314,19 @@ def test_example_agent_forwards_chat_completions():
         deadline = time.time() + 5
         while True:
             try:
-                sent = post(example, "/v1/chat/completions", {
-                    "model": "example",
-                    "messages": [{"role": "user", "content": "Say hello."}],
-                    "tools": [{"type": "function", "function": {"name": "fetch"}}],
-                    "response_format": {"type": "json_schema", "json_schema": {"name": "cited_answer"}},
-                })
+                sent = post(
+                    example,
+                    "/v1/chat/completions",
+                    {
+                        "model": "example",
+                        "messages": [{"role": "user", "content": "Say hello."}],
+                        "tools": [{"type": "function", "function": {"name": "fetch"}}],
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {"name": "cited_answer"},
+                        },
+                    },
+                )
                 break
             except OSError:
                 if time.time() > deadline:
@@ -324,15 +345,19 @@ def test_example_agent_forwards_chat_completions():
 
 
 def cited_note(web_path: str) -> str:
-    return json.dumps({
-        "response": "The note records fatigue [cite:1].",
-        "citations": [{
-            "id": "1",
-            "file": "clinic_note.txt",
-            "web_path": web_path,
-            "summary": "Chief complaint: fatigue.",
-        }],
-    })
+    return json.dumps(
+        {
+            "response": "The note records fatigue [cite:1].",
+            "citations": [
+                {
+                    "id": "1",
+                    "file": "clinic_note.txt",
+                    "web_path": web_path,
+                    "summary": "Chief complaint: fatigue.",
+                }
+            ],
+        }
+    )
 
 
 def _note_slice(messages: list[dict]) -> dict | None:
@@ -380,10 +405,12 @@ def cited_handle(handle: str, messages: list[dict] | None = None) -> str:
     if evidence:
         citation["evidence"] = [evidence]
 
-    return json.dumps({
-        "response": f"The note records fatigue [cite:{handle}].",
-        "citations": [citation],
-    })
+    return json.dumps(
+        {
+            "response": f"The note records fatigue [cite:{handle}].",
+            "citations": [citation],
+        }
+    )
 
 
 def _cite_handle(messages: list[dict]) -> str:
@@ -446,29 +473,39 @@ class FakeAgent(BaseHTTPRequestHandler):
             return 200, self.message(content="```json\n" + json.dumps(CARD) + "\n```")
 
         if "[dump]" in question and not corrected:
-            return 200, self.message(content=(
-                'The scan is a CT [cite:dicom:1.2.3].\n\n'
-                '{"response": "The scan is a CT [cite:dicom:1.2.3].", "citations":'
-            ))
+            return 200, self.message(
+                content=(
+                    "The scan is a CT [cite:dicom:1.2.3].\n\n"
+                    '{"response": "The scan is a CT [cite:dicom:1.2.3].", "citations":'
+                )
+            )
 
         if "[dump]" in question:
             return 200, self.message(content=cited_note(note["web_path"]))
 
         if "[echo]" in question and not corrected:
-            return 200, self.message(content='{"when": "Plain text is fine.", "message": ""}')
+            return 200, self.message(
+                content='{"when": "Plain text is fine.", "message": ""}'
+            )
 
         if "[wrap]" in question:
-            return 200, self.message(content='{"message": "Hello! How can I assist you today?"}')
+            return 200, self.message(
+                content='{"message": "Hello! How can I assist you today?"}'
+            )
 
         if "[broken]" in question:
             return 200, {"oops": True}
 
         if "[bad args]" in question and not has_read:
-            return 200, self.message(tool_calls=[{
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "fetch", "arguments": "{not json"},
-            }])
+            return 200, self.message(
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "fetch", "arguments": "{not json"},
+                    }
+                ]
+            )
 
         if "[no tools]" in question and "tools" in body:
             return 400, {"error": {"message": "tools are not supported"}}
@@ -477,47 +514,70 @@ class FakeAgent(BaseHTTPRequestHandler):
             return 400, {"error": {"message": "response_format is not supported"}}
 
         if "[discover]" in question and not has_read:
-            return 200, self.message(tool_calls=[{
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "discover", "arguments": json.dumps({"root": "/tmp"})},
-            }])
+            return 200, self.message(
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "discover",
+                            "arguments": json.dumps({"root": "/tmp"}),
+                        },
+                    }
+                ]
+            )
 
         if "[read]" in question and not has_read:
-            return 200, self.message(tool_calls=[{
-                "id": "call_1",
-                "type": "function",
-                "function": {
-                    "name": "fetch",
-                    "arguments": json.dumps({"resource_id": note["id"], "view": "text"}),
-                },
-            }])
+            return 200, self.message(
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "fetch",
+                            "arguments": json.dumps(
+                                {"resource_id": note["id"], "view": "text"}
+                            ),
+                        },
+                    }
+                ]
+            )
 
         if "[never]" in question or ("[forget]" in question and not corrected):
             return 200, self.message(content="Fatigue.")
 
         if "[alone]" in question and has_read and not corrected:
             handle = _cite_handle(messages)
-            alone = json.dumps({
-                "response": f"The note records fatigue. [cite:{handle}]",
-                "citations": [{
-                    "cite": handle,
-                    "summary": "Chief complaint: fatigue.",
-                }],
-            })
+            alone = json.dumps(
+                {
+                    "response": f"The note records fatigue. [cite:{handle}]",
+                    "citations": [
+                        {
+                            "cite": handle,
+                            "summary": "Chief complaint: fatigue.",
+                        }
+                    ],
+                }
+            )
             return 200, self.message(content=alone)
 
         if "[multi]" in question and has_read and not corrected:
             handle = _cite_handle(messages)
-            return 200, self.message(content=json.dumps({
-                "response": (
-                    f"The CT and the note both record fatigue [cite:{handle}] [cite:{handle}]."
-                ),
-                "citations": [{
-                    "cite": handle,
-                    "summary": "Chief complaint: fatigue.",
-                }],
-            }))
+            return 200, self.message(
+                content=json.dumps(
+                    {
+                        "response": (
+                            f"The CT and the note both record fatigue [cite:{handle}] [cite:{handle}]."
+                        ),
+                        "citations": [
+                            {
+                                "cite": handle,
+                                "summary": "Chief complaint: fatigue.",
+                            }
+                        ],
+                    }
+                )
+            )
 
         if "[multi]" in question and has_read:
             handle = _cite_handle(messages)
@@ -530,24 +590,32 @@ class FakeAgent(BaseHTTPRequestHandler):
             if evidence:
                 citation["evidence"] = [evidence]
 
-            return 200, self.message(content=json.dumps({
-                "response": (
-                    f"The CT records fatigue [cite:{handle}]. The note records it too [cite:{handle}]."
-                ),
-                "citations": [citation],
-            }))
+            return 200, self.message(
+                content=json.dumps(
+                    {
+                        "response": (
+                            f"The CT records fatigue [cite:{handle}]. The note records it too [cite:{handle}]."
+                        ),
+                        "citations": [citation],
+                    }
+                )
+            )
 
         if "[discover]" in question and has_read:
             return 200, self.message(content="Discovered.")
 
         if has_read:
-            return 200, self.message(content=f"```json\n{cited_handle(_cite_handle(messages), messages)}\n```")
+            return 200, self.message(
+                content=f"```json\n{cited_handle(_cite_handle(messages), messages)}\n```"
+            )
 
         return 200, self.message(content="Plain answer.")
 
     @staticmethod
     def message(**fields) -> dict:
-        return {"choices": [{"message": {"role": "assistant", "content": None, **fields}}]}
+        return {
+            "choices": [{"message": {"role": "assistant", "content": None, **fields}}]
+        }
 
     def log_message(self, *args):
         pass
@@ -567,7 +635,11 @@ def dispatch_server(case_folder):
 
 
 def requests_for(question: str) -> list[dict]:
-    return [body for body in FakeAgent.requests if body["messages"][1]["content"] == question]
+    return [
+        body
+        for body in FakeAgent.requests
+        if body["messages"][1]["content"] == question
+    ]
 
 
 def test_audit_run_records_tools_refusals_and_calls(dispatch_server):
@@ -674,14 +746,20 @@ def test_server_reads_the_folder_it_opened(dispatch_server):
     answer = wait_for_answer(dispatch_server, session_id)["history"][-1]
 
     assert answer["content"] == "Discovered."
-    tool = next(item for item in requests_for(question)[-1]["messages"] if item["role"] == "tool")
+    tool = next(
+        item
+        for item in requests_for(question)[-1]["messages"]
+        if item["role"] == "tool"
+    )
     assert json.loads(tool["content"])["result"]["root"].endswith("P0042")
 
 
 def test_server_rejects_a_marker_that_stands_alone(dispatch_server):
     question = "[read][alone] What does the note say?"
     session_id = send_chat(dispatch_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(dispatch_server, session_id)["history"][-1]["content"])
+    answer = json.loads(
+        wait_for_answer(dispatch_server, session_id)["history"][-1]["content"]
+    )
 
     assert answer["response"].count("[cite:c1]") == 1
     assert any(
@@ -712,7 +790,9 @@ def test_json_without_files_is_sent_back_for_plain_text(dispatch_server):
 def test_prose_followed_by_json_is_sent_back_for_a_citation_object(dispatch_server):
     question = "[dump] Have a look at its imaging"
     session_id = send_chat(dispatch_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(dispatch_server, session_id)["history"][-1]["content"])
+    answer = json.loads(
+        wait_for_answer(dispatch_server, session_id)["history"][-1]["content"]
+    )
 
     assert answer["response"].count("[cite:1]") == 1
     assert any(
@@ -735,7 +815,10 @@ def _until_assistants(page, session_ids, timeout=10):
 
         seen.append(pushed)
 
-        if pushed.get("type") == "assistant" and pushed.get("session_id") in session_ids:
+        if (
+            pushed.get("type") == "assistant"
+            and pushed.get("session_id") in session_ids
+        ):
             got.add(pushed["session_id"])
 
     if got != set(session_ids):
@@ -745,8 +828,12 @@ def _until_assistants(page, session_ids, timeout=10):
 
 
 def test_server_runs_the_agents_tool_calls(dispatch_server):
-    session_id = send_chat(dispatch_server, "[read] What does the note say?")["session_id"]
-    answer = json.loads(wait_for_answer(dispatch_server, session_id)["history"][-1]["content"])
+    session_id = send_chat(dispatch_server, "[read] What does the note say?")[
+        "session_id"
+    ]
+    answer = json.loads(
+        wait_for_answer(dispatch_server, session_id)["history"][-1]["content"]
+    )
 
     assert "[cite:c1]" in answer["response"]
     citation = answer["citations"][0]
@@ -767,8 +854,11 @@ def test_a_read_arrives_as_a_step_with_its_cite_token(dispatch_server):
         seen = _until_assistants(page, [session_id])
 
     finished = [
-        item for item in seen
-        if item["type"] == "step" and item["status"] == "done" and item["kind"] == "tool"
+        item
+        for item in seen
+        if item["type"] == "step"
+        and item["status"] == "done"
+        and item["kind"] == "tool"
     ]
     assert len(finished) == 1
     assert finished[0]["session_id"] == session_id
@@ -803,7 +893,9 @@ def test_the_page_hears_what_the_question_is_doing(dispatch_server):
     assert "Revising the answer" in labels
     assert all(isinstance(item["elapsed_ms"], int) for item in statuses)
 
-    done = next(item for item in seen if item["type"] == "step" and item["status"] == "done")
+    done = next(
+        item for item in seen if item["type"] == "step" and item["status"] == "done"
+    )
     assert isinstance(done["duration_ms"], int)
     assert isinstance(done["started_ms"], int)
 
@@ -817,7 +909,9 @@ def test_the_page_hears_what_the_question_is_doing(dispatch_server):
 
 
 def test_a_bad_tool_call_ends_as_an_error_step(dispatch_server):
-    session_id = send_chat(dispatch_server, "[bad args] Try a broken fetch.")["session_id"]
+    session_id = send_chat(dispatch_server, "[bad args] Try a broken fetch.")[
+        "session_id"
+    ]
     steps = wait_for_answer(dispatch_server, session_id)["history"][-1]["steps"]
     tools = [step for step in steps if step["kind"] == "tool"]
 
@@ -829,11 +923,15 @@ def test_a_bad_tool_call_ends_as_an_error_step(dispatch_server):
 def test_steps_carry_the_session_that_asked(dispatch_server):
     with connect(dispatch_server["ws"] + "/ws") as page:
         assert json.loads(page.recv(timeout=5))["type"] == "system"
-        asking = send_chat(dispatch_server, "[read] Steps stay on this session.")["session_id"]
+        asking = send_chat(dispatch_server, "[read] Steps stay on this session.")[
+            "session_id"
+        ]
         other = send_chat(dispatch_server, "Another session says hello.")["session_id"]
         seen = _until_assistants(page, [asking, other])
 
-    tool_steps = [item for item in seen if item["type"] == "step" and item["kind"] == "tool"]
+    tool_steps = [
+        item for item in seen if item["type"] == "step" and item["kind"] == "tool"
+    ]
     assert tool_steps
     assert {item["session_id"] for item in tool_steps} == {asking}
     asking_answer = wait_for_answer(dispatch_server, asking)["history"][-1]
@@ -870,7 +968,9 @@ def test_a_plain_answer_has_no_steps(dispatch_server):
 def test_server_rejects_markers_side_by_side(dispatch_server):
     question = "[read][multi] What does the note say?"
     session_id = send_chat(dispatch_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(dispatch_server, session_id)["history"][-1]["content"])
+    answer = json.loads(
+        wait_for_answer(dispatch_server, session_id)["history"][-1]["content"]
+    )
 
     assert answer["response"] == (
         "The CT records fatigue [cite:c1]. The note records it too [cite:c1]."
@@ -884,7 +984,9 @@ def test_server_rejects_markers_side_by_side(dispatch_server):
 def test_server_asks_the_agent_to_fix_missing_citations(dispatch_server):
     question = "[read][forget] What does the note say?"
     session_id = send_chat(dispatch_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(dispatch_server, session_id)["history"][-1]["content"])
+    answer = json.loads(
+        wait_for_answer(dispatch_server, session_id)["history"][-1]["content"]
+    )
 
     assert "[cite:c1]" in answer["response"]
     assert any(
@@ -894,7 +996,9 @@ def test_server_asks_the_agent_to_fix_missing_citations(dispatch_server):
 
 
 def test_server_gives_up_after_repeated_bad_citations(dispatch_server):
-    session_id = send_chat(dispatch_server, "[read][never] What does the note say?")["session_id"]
+    session_id = send_chat(dispatch_server, "[read][never] What does the note say?")[
+        "session_id"
+    ]
     answer = wait_for_answer(dispatch_server, session_id)["history"][-1]
 
     assert "could not produce an answer" in answer["content"]
@@ -912,7 +1016,9 @@ def test_server_retries_without_tools_when_the_agent_refuses_them(dispatch_serve
 def test_the_answer_schema_is_sent_once_the_agent_has_read(dispatch_server):
     question = "[read] Which schema does the note answer use?"
     session_id = send_chat(dispatch_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(dispatch_server, session_id)["history"][-1]["content"])
+    answer = json.loads(
+        wait_for_answer(dispatch_server, session_id)["history"][-1]["content"]
+    )
 
     assert "[cite:c1]" in answer["response"]
     bodies = requests_for(question)
@@ -926,10 +1032,16 @@ def test_the_answer_schema_is_sent_once_the_agent_has_read(dispatch_server):
 def test_server_retries_without_the_schema_when_the_agent_refuses_it(dispatch_server):
     question = "[read][no schema] What does the note say?"
     session_id = send_chat(dispatch_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(dispatch_server, session_id)["history"][-1]["content"])
+    answer = json.loads(
+        wait_for_answer(dispatch_server, session_id)["history"][-1]["content"]
+    )
 
     assert "[cite:c1]" in answer["response"]
-    assert ["response_format" in body for body in requests_for(question)] == [False, True, False]
+    assert ["response_format" in body for body in requests_for(question)] == [
+        False,
+        True,
+        False,
+    ]
     assert all("tools" in body for body in requests_for(question))
 
 
@@ -938,7 +1050,11 @@ def test_bad_tool_arguments_are_returned_to_the_agent(dispatch_server):
     session_id = send_chat(dispatch_server, question)["session_id"]
     wait_for_answer(dispatch_server, session_id)
 
-    tool = next(item for item in requests_for(question)[-1]["messages"] if item["role"] == "tool")
+    tool = next(
+        item
+        for item in requests_for(question)[-1]["messages"]
+        if item["role"] == "tool"
+    )
     result = json.loads(tool["content"])
     assert result["status"] == "error"
     assert "not valid JSON" in result["message"]
@@ -956,429 +1072,6 @@ def test_an_unreachable_agent_is_reported(server):
     answer = wait_for_answer(server, session_id)["history"][-1]
 
     assert "could not reach" in answer["content"]
-
-
-def test_server_rejects_a_bad_specialist_name(case_folder):
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "meddataos.server",
-            str(case_folder),
-            "--agent-url",
-            "http://127.0.0.1:9/v1",
-            "--specialist",
-            "Notes=http://127.0.0.1:9/v1",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-
-    assert result.returncode != 0
-    assert "lowercase" in result.stderr
-
-
-def _question_bodies(handler, question: str) -> list[dict]:
-    return [
-        body for body in handler.requests
-        if any(
-            message.get("role") == "user" and message.get("content") == question
-            for message in body.get("messages", [])
-        )
-    ]
-
-
-class Router(BaseHTTPRequestHandler):
-    """Router fake: calls the specialist named by a tag in the question."""
-
-    requests: list[dict] = []
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-        Router.requests.append(body)
-        status, payload = self.respond(body)
-        data = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def respond(self, body: dict) -> tuple[int, dict]:
-        messages = body["messages"]
-        question = next(item["content"] for item in messages if item["role"] == "user")
-        tool_msgs = [item for item in messages if item["role"] == "tool"]
-
-        if question == "Fill in the patient card." and not tool_msgs:
-            return 200, FakeAgent.message(content="```json\n" + json.dumps(CARD) + "\n```")
-
-        if not tool_msgs:
-            calls = []
-
-            if "[notes]" in question or "[badcite]" in question or "[strip]" in question:
-                calls.append(self._consult("notes", "call_notes", question))
-
-            if "[twice]" in question:
-                calls.append(self._consult("notes", "call_notes_2", question))
-
-            if "[scan]" in question:
-                calls.append(self._consult("imaging", "call_imaging", question))
-
-            if calls:
-                return 200, FakeAgent.message(tool_calls=calls)
-
-            return 200, FakeAgent.message(content="Plain answer.")
-
-        parsed = [json.loads(item["content"]) for item in tool_msgs]
-        ok = [
-            item["result"] for item in parsed
-            if item.get("status") == "ok" and isinstance(item.get("result"), str)
-        ]
-        errors = [item["message"] for item in parsed if item.get("status") == "error"]
-        cited = next((item for item in ok if "[cite:" in item), None)
-
-        if cited:
-            payload = json.loads(cited)
-
-            if "[strip]" in question:
-                # What the strict answer schema leaves of a specialist's citation.
-                payload["citations"] = [
-                    {
-                        "kind": "file",
-                        "id": item["id"],
-                        "file": item["file"],
-                        "web_path": item["web_path"],
-                        "summary": item["summary"],
-                        "agent": None,
-                    }
-                    for item in payload["citations"]
-                ]
-
-            if errors:
-                payload["response"] = "Imaging specialist failed. " + payload["response"]
-
-            return 200, FakeAgent.message(content=json.dumps(payload))
-
-        if errors:
-            return 200, FakeAgent.message(content="Specialist failed: " + errors[0])
-
-        return 200, FakeAgent.message(content="Plain answer.")
-
-    @staticmethod
-    def _consult(name: str, call_id: str, question: str) -> dict:
-        return {
-            "id": call_id,
-            "type": "function",
-            "function": {
-                "name": f"consult_{name}",
-                "arguments": json.dumps({"question": question}),
-            },
-        }
-
-    def log_message(self, *args):
-        pass
-
-
-class NotesSpecialist(BaseHTTPRequestHandler):
-    """Returns a citation for the clinic note, or for a file that is not in the case."""
-
-    requests: list[dict] = []
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-        NotesSpecialist.requests.append(body)
-        question = next(item["content"] for item in body["messages"] if item["role"] == "user")
-        path = "/case/missing.txt" if "[badcite]" in question else "/case/clinic_note.txt"
-        content = cited_note(path)
-
-        if "[strip]" in question:
-            checked = json.loads(content)
-            checked["citations"][0].update({
-                "agent": "clinical_notes",
-                "evidence": [{
-                    "n": 1,
-                    "claim": "The patient has fatigue",
-                    "quote": "fatigue",
-                    "start": 0,
-                    "end": 7,
-                    "span_url": "/api/cases/P0042/notes/span?id=note%3Ax&start=0&end=7",
-                }],
-                "conflicts": [{
-                    "attribute": "symptom",
-                    "severity": "high",
-                    "values": [{"value": "fatigue", "note_label": "clinic_note"}],
-                }],
-            })
-            content = json.dumps(checked)
-
-        data = json.dumps(FakeAgent.message(content=content)).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *args):
-        pass
-
-
-class ImagingSpecialist(BaseHTTPRequestHandler):
-    """Always fails, the way a specialist process that is down would."""
-
-    requests: list[dict] = []
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        ImagingSpecialist.requests.append(json.loads(self.rfile.read(length) or b"{}"))
-        data = json.dumps({"error": {"message": "imaging model down"}}).encode()
-        self.send_response(500)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *args):
-        pass
-
-
-@pytest.fixture(scope="module")
-def routing_server(case_folder, tmp_path_factory):
-    Router.requests = []
-    NotesSpecialist.requests = []
-    ImagingSpecialist.requests = []
-    router = ThreadingHTTPServer(("127.0.0.1", 0), Router)
-    notes = ThreadingHTTPServer(("127.0.0.1", 0), NotesSpecialist)
-    imaging = ThreadingHTTPServer(("127.0.0.1", 0), ImagingSpecialist)
-
-    for endpoint in (router, notes, imaging):
-        threading.Thread(target=endpoint.serve_forever, daemon=True).start()
-
-    config = tmp_path_factory.mktemp("routing") / "agents.toml"
-    config.write_text(
-        "\n".join([
-            "[notes]",
-            f'url = "http://127.0.0.1:{notes.server_address[1]}/v1"',
-            'description = "Answers from clinical notes."',
-            "",
-            "[imaging]",
-            f'url = "http://127.0.0.1:{imaging.server_address[1]}/v1"',
-            'description = "Interprets imaging."',
-            "",
-        ])
-    )
-
-    try:
-        with running_server(
-            case_folder,
-            agent_url=f"http://127.0.0.1:{router.server_address[1]}/v1",
-            agents_file=str(config),
-            AGENT_MODEL="router",
-        ) as running:
-            yield running
-    finally:
-        for endpoint in (router, notes, imaging):
-            endpoint.shutdown()
-
-
-def test_router_cites_notes_and_reports_an_imaging_failure(routing_server):
-    question = "[notes][scan] What do the note and the scan show?"
-    session_id = send_chat(routing_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(routing_server, session_id)["history"][-1]["content"])
-
-    assert "Imaging specialist failed" in answer["response"]
-    # The specialist's marker reaches the router as a finding id.
-    assert "[cite:notes.1]" in answer["response"]
-    assert answer["citations"][0]["web_path"].endswith("clinic_note.txt")
-    assert answer["citations"][0]["finding"] == "notes.1"
-
-    router_tools = _question_bodies(Router, question)[0]["tools"]
-    tool_names = [tool["function"]["name"] for tool in router_tools]
-    assert "consult_notes" in tool_names
-    assert "consult_imaging" in tool_names
-    assert "fetch" in tool_names
-    notes_tool = next(tool for tool in router_tools if tool["function"]["name"] == "consult_notes")
-    assert notes_tool["function"]["description"] == "Answers from clinical notes."
-
-    notes_call = _question_bodies(NotesSpecialist, question)
-    assert len(notes_call) == 1
-    specialist_tools = [tool["function"]["name"] for tool in notes_call[0]["tools"]]
-    assert "fetch" in specialist_tools
-    assert all(not name.startswith("consult_") for name in specialist_tools)
-    assert len(_question_bodies(ImagingSpecialist, question)) == 1
-
-
-def test_a_specialist_is_consulted_once_per_question(routing_server):
-    question = "[notes][twice] Read the note twice"
-    session_id = send_chat(routing_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(routing_server, session_id)["history"][-1]["content"])
-
-    assert answer["citations"][0]["web_path"].endswith("clinic_note.txt")
-    assert len(_question_bodies(NotesSpecialist, question)) == 1
-
-    sent_back = next(
-        body for body in _question_bodies(Router, question)
-        if any(item["role"] == "tool" for item in body["messages"])
-    )
-    assistant = next(item for item in sent_back["messages"] if item["role"] == "assistant")
-    assert [call["function"]["name"] for call in assistant["tool_calls"]] == [
-        "consult_notes",
-        "consult_notes",
-    ]
-    tool_messages = [item for item in sent_back["messages"] if item["role"] == "tool"]
-    assert len(tool_messages) == 2
-    assert json.loads(tool_messages[0]["content"])["status"] == "ok"
-    assert json.loads(tool_messages[0]["content"]) == json.loads(tool_messages[1]["content"])
-
-
-def test_the_page_gets_the_specialists_checked_citation_not_the_routers_copy(routing_server):
-    question = "[strip] What does the note say?"
-    session_id = send_chat(routing_server, question)["session_id"]
-    answer = json.loads(wait_for_answer(routing_server, session_id)["history"][-1]["content"])
-    citation = answer["citations"][0]
-
-    assert citation["agent"] == "clinical_notes"
-    assert citation["evidence"][0]["span_url"].endswith("start=0&end=7")
-    assert citation["evidence"][0]["quote"] == "fatigue"
-    assert citation["conflicts"][0]["attribute"] == "symptom"
-
-
-def test_a_specialist_citation_outside_the_case_is_an_error(routing_server):
-    question = "[badcite] Cite something else"
-    session_id = send_chat(routing_server, question)["session_id"]
-    answer = wait_for_answer(routing_server, session_id, timeout=20)["history"][-1]
-
-    assert "Specialist failed" in answer["content"]
-    assert "missing.txt" in answer["content"]
-    # The original reply plus one request per citation correction.
-    assert len(_question_bodies(NotesSpecialist, question)) == 7
-
-
-CASE_TCGA = APP / "data" / "TCGA-DD-A4NF"
-
-
-class NotesRouter(BaseHTTPRequestHandler):
-    """Always consults the notes specialist, then shows that reply."""
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-        messages = body["messages"]
-        question = next(item["content"] for item in messages if item["role"] == "user")
-        tool_msgs = [item for item in messages if item["role"] == "tool"]
-
-        if question == "Fill in the patient card." and not tool_msgs:
-            content = json.dumps({
-                "name": "TCGA-DD-A4NF",
-                "age": "72",
-                "sex": "M",
-                "blood_type": None,
-                "allergies": [],
-                "conditions": ["HCC"],
-                "data_dates": {},
-            })
-            payload = FakeAgent.message(content=content)
-        elif not tool_msgs:
-            payload = FakeAgent.message(tool_calls=[{
-                "id": "call_notes",
-                "type": "function",
-                "function": {
-                    "name": "consult_notes",
-                    "arguments": json.dumps({"question": question}),
-                },
-            }])
-        else:
-            result = json.loads(tool_msgs[-1]["content"])
-            text = result.get("result") if result.get("status") == "ok" else (
-                "Specialist failed: " + result.get("message", "")
-            )
-            payload = FakeAgent.message(content=text)
-
-        data = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *args):
-        pass
-
-
-@pytest.mark.skipif(
-    os.getenv("NOTES_LIVE_EVAL") != "1",
-    reason="live notes agent: set NOTES_LIVE_EVAL=1",
-)
-def test_notes_agent_answers_a_real_case(tmp_path):
-    """Router calls the real notes specialist on TCGA-DD-A4NF."""
-    question = "What was the histology and grade of the resected liver tumor?"
-    notes_port = _free_port()
-    notes_log = tmp_path / "notes.log"
-    log_handle = notes_log.open("w")
-    env = os.environ.copy()
-    env.pop("PYTHONSAFEPATH", None)
-    env["PYTHONUNBUFFERED"] = "1"
-    notes_proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "meddataos.specialists.notes.serve",
-            "--case",
-            str(CASE_TCGA),
-            "--port",
-            str(notes_port),
-        ],
-        cwd=APP,
-        env=env,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    router = ThreadingHTTPServer(("127.0.0.1", 0), NotesRouter)
-    threading.Thread(target=router.serve_forever, daemon=True).start()
-    config = tmp_path / "agents.toml"
-    config.write_text(
-        "\n".join([
-            "[notes]",
-            f'url = "http://127.0.0.1:{notes_port}/v1"',
-            'description = "Answers from clinical notes with verified quotes."',
-            "",
-        ])
-    )
-
-    try:
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if notes_proc.poll() is not None:
-                raise AssertionError(notes_log.read_text()[-2000:])
-            try:
-                urllib.request.urlopen(f"http://127.0.0.1:{notes_port}/v1/chat/completions", timeout=1)
-            except urllib.error.HTTPError:
-                break
-            except OSError:
-                time.sleep(0.2)
-        else:
-            raise AssertionError("notes agent did not start:\n" + notes_log.read_text()[-2000:])
-
-        with running_server(
-            CASE_TCGA,
-            agent_url=f"http://127.0.0.1:{router.server_address[1]}/v1",
-            agents_file=str(config),
-            AGENT_MODEL="router",
-            AGENT_TIMEOUT="300",
-        ) as server:
-            session_id = send_chat(server, question, patient_id="TCGA-DD-A4NF")["session_id"]
-            answer = wait_for_answer(server, session_id, timeout=300)["history"][-1]["content"]
-
-        parsed = json.loads(answer)
-        text = parsed["response"].lower()
-        assert "hepatocellular" in text or "hcc" in text
-        assert any(token in text for token in ("moderately", "g2", "grade 2"))
-        assert parsed["citations"]
-        assert parsed["citations"][0]["web_path"].startswith("/case/")
-    finally:
-        router.shutdown()
-        notes_proc.terminate()
-        notes_proc.wait(timeout=20)
-        log_handle.close()
 
 
 def _write_tiny_ct(path: Path, series_uid: str, instance_number: int) -> None:
@@ -1430,51 +1123,69 @@ class DicomFetchAgent(BaseHTTPRequestHandler):
         tool_msgs = [item for item in messages if item["role"] == "tool"]
 
         if question == "Fill in the patient card.":
-            content = json.dumps({
-                "name": "Tiny",
-                "age": "1",
-                "sex": "",
-                "blood_type": None,
-                "allergies": [],
-                "conditions": [],
-                "data_dates": {},
-            })
+            content = json.dumps(
+                {
+                    "name": "Tiny",
+                    "age": "1",
+                    "sex": "",
+                    "blood_type": None,
+                    "allergies": [],
+                    "conditions": [],
+                    "data_dates": {},
+                }
+            )
         elif len(tool_msgs) == 0:
-            payload = FakeAgent.message(tool_calls=[{
-                "id": "call_meta",
-                "type": "function",
-                "function": {
-                    "name": "fetch",
-                    "arguments": json.dumps({"resource_id": series["id"], "view": "metadata"}),
-                },
-            }])
+            payload = FakeAgent.message(
+                tool_calls=[
+                    {
+                        "id": "call_meta",
+                        "type": "function",
+                        "function": {
+                            "name": "fetch",
+                            "arguments": json.dumps(
+                                {"resource_id": series["id"], "view": "metadata"}
+                            ),
+                        },
+                    }
+                ]
+            )
             self._send(payload)
             return
         elif len(tool_msgs) == 1:
-            payload = FakeAgent.message(tool_calls=[{
-                "id": "call_preview",
-                "type": "function",
-                "function": {
-                    "name": "fetch",
-                    "arguments": json.dumps({
-                        "resource_id": series["id"],
-                        "view": "preview",
-                        "slice_index": 0,
-                        "window": "lung",
-                    }),
-                },
-            }])
+            payload = FakeAgent.message(
+                tool_calls=[
+                    {
+                        "id": "call_preview",
+                        "type": "function",
+                        "function": {
+                            "name": "fetch",
+                            "arguments": json.dumps(
+                                {
+                                    "resource_id": series["id"],
+                                    "view": "preview",
+                                    "slice_index": 0,
+                                    "window": "lung",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
             self._send(payload)
             return
         else:
             handle = _cite_handle(tool_msgs)
-            content = json.dumps({
-                "response": f"The series is a chest CT [cite:{handle}].",
-                "citations": [{
-                    "cite": handle,
-                    "summary": "Lung window, first slice.",
-                }],
-            })
+            content = json.dumps(
+                {
+                    "response": f"The series is a chest CT [cite:{handle}].",
+                    "citations": [
+                        {
+                            "cite": handle,
+                            "summary": "Lung window, first slice.",
+                        }
+                    ],
+                }
+            )
 
         self._send(FakeAgent.message(content=content))
 
@@ -1506,8 +1217,12 @@ def test_a_dicom_citation_keeps_the_fetch(tmp_path):
             agent_url=f"http://127.0.0.1:{agent.server_address[1]}/v1",
             AGENT_MODEL="dicom",
         ) as server:
-            session_id = send_chat(server, "What is the scan?", patient_id=tmp_path.name)["session_id"]
-            answer = json.loads(wait_for_answer(server, session_id)["history"][-1]["content"])
+            session_id = send_chat(
+                server, "What is the scan?", patient_id=tmp_path.name
+            )["session_id"]
+            answer = json.loads(
+                wait_for_answer(server, session_id)["history"][-1]["content"]
+            )
             citation = answer["citations"][0]
             preview = citation["dicom"]["previews"][-1]
             assert citation["cite"] == "c2"
@@ -1519,12 +1234,16 @@ def test_a_dicom_citation_keeps_the_fetch(tmp_path):
             assert preview["slice_index"] == 0
             assert preview["window"] == "lung"
             assert "metadata" not in citation["dicom"]
-            quoted = urllib.parse.urlencode({
-                "web_path": citation["web_path"],
-                "slice_index": preview["slice_index"],
-                "window": preview["window"],
-            })
-            with urllib.request.urlopen(server["http"] + "/api/dicom/preview?" + quoted) as response:
+            quoted = urllib.parse.urlencode(
+                {
+                    "web_path": citation["web_path"],
+                    "slice_index": preview["slice_index"],
+                    "window": preview["window"],
+                }
+            )
+            with urllib.request.urlopen(
+                server["http"] + "/api/dicom/preview?" + quoted
+            ) as response:
                 body = response.read()
                 assert response.headers.get_content_type() == "image/png"
             assert body.startswith(b"\x89PNG\r\n\x1a\n")
@@ -1533,7 +1252,8 @@ def test_a_dicom_citation_keeps_the_fetch(tmp_path):
 
 
 def test_a_cite_handle_expands_to_the_call_that_made_it():
-    from meddataos.server.case import Answer, case as open_case
+    from meddataos.core.verifier import Answer
+    from meddataos.server.case import case as open_case
 
     calls = {
         "c1": {
@@ -1554,12 +1274,14 @@ def test_a_cite_handle_expands_to_the_call_that_made_it():
             "file": "ct",
             "web_path": "/case/ct",
             "dicom": {
-                "previews": [{
-                    "web_path": "/case/ct",
-                    "slice_index": 77,
-                    "n_slices": 120,
-                    "overlay": True,
-                }],
+                "previews": [
+                    {
+                        "web_path": "/case/ct",
+                        "slice_index": 77,
+                        "n_slices": 120,
+                        "overlay": True,
+                    }
+                ],
             },
         },
         "c3": {
@@ -1569,18 +1291,20 @@ def test_a_cite_handle_expands_to_the_call_that_made_it():
             "web_path": "/case/2006-02-13-rt-completion.txt",
         },
     }
-    text = json.dumps({
-        "response": (
-            "The tumour is contoured on the CT [cite:c2]. "
-            "The RTSTRUCT names that contour [cite:c1]. "
-            "Treatment finished in February [cite:c3]."
-        ),
-        "citations": [
-            {"cite": "c2", "summary": "Slice 77 with the contour."},
-            {"cite": "c1", "summary": "RTSTRUCT metadata."},
-            {"cite": "c3", "summary": "Treatment finished."},
-        ],
-    })
+    text = json.dumps(
+        {
+            "response": (
+                "The tumour is contoured on the CT [cite:c2]. "
+                "The RTSTRUCT names that contour [cite:c1]. "
+                "Treatment finished in February [cite:c3]."
+            ),
+            "citations": [
+                {"cite": "c2", "summary": "Slice 77 with the contour."},
+                {"cite": "c1", "summary": "RTSTRUCT metadata."},
+                {"cite": "c3", "summary": "Treatment finished."},
+            ],
+        }
+    )
 
     parsed = json.loads(open_case.expand_citations(text, calls))
     preview_citation = parsed["citations"][0]
@@ -1604,7 +1328,7 @@ def test_a_cite_handle_expands_to_the_call_that_made_it():
 
 
 def test_every_answer_schema_example_is_valid():
-    import meddataos.server.answer as answer
+    import meddataos.core.verifier.schema as answer
 
     for model in (
         answer.Evidence,
@@ -1623,10 +1347,18 @@ def test_every_answer_schema_example_is_valid():
 
 
 def test_the_strict_answer_schema_uses_only_what_strict_mode_accepts():
-    import meddataos.server.answer as answer
+    import meddataos.core.verifier.schema as answer
 
     schema = answer.response_format()["json_schema"]["schema"]
-    rejected = {"oneOf", "const", "examples", "default", "title", "discriminator", "minItems"}
+    rejected = {
+        "oneOf",
+        "const",
+        "examples",
+        "default",
+        "title",
+        "discriminator",
+        "minItems",
+    }
 
     def walk(node):
         if isinstance(node, list):
@@ -1657,12 +1389,16 @@ def test_the_strict_answer_schema_uses_only_what_strict_mode_accepts():
 
 
 def test_a_dicom_call_must_be_cited_as_imaging():
-    from meddataos.server.case import Answer
+    from meddataos.core.verifier import Answer
 
     calls = {
         "c1": {
             "tool": "fetch",
-            "arguments": {"resource_id": "dicom:ct", "view": "preview", "slice_index": 77},
+            "arguments": {
+                "resource_id": "dicom:ct",
+                "view": "preview",
+                "slice_index": 77,
+            },
             "modality": "dicom",
             "file": "ct",
             "web_path": "/case/ct",
@@ -1670,10 +1406,12 @@ def test_a_dicom_call_must_be_cited_as_imaging():
     }
 
     def problem(citation: dict) -> str | None:
-        text = json.dumps({
-            "response": "The tumour sits at the glottic larynx [cite:c1].",
-            "citations": [{"cite": "c1", "summary": "Slice 77.", **citation}],
-        })
+        text = json.dumps(
+            {
+                "response": "The tumour sits at the glottic larynx [cite:c1].",
+                "citations": [{"cite": "c1", "summary": "Slice 77.", **citation}],
+            }
+        )
         return Answer(text, [], [], calls).problem
 
     assert problem({}) is None
@@ -1689,7 +1427,7 @@ def test_a_dicom_call_must_be_cited_as_imaging():
 
 
 def test_a_volume_call_may_be_cited_as_derived():
-    from meddataos.server.case import Answer
+    from meddataos.core.verifier import Answer
 
     calls = {
         "c5": {
@@ -1707,70 +1445,97 @@ def test_a_volume_call_may_be_cited_as_derived():
     }
 
     def problem(citation: dict) -> str | None:
-        text = json.dumps({
-            "response": "GTVp volume is 2.592 cm³ [cite:c5].",
-            "citations": [citation],
-        })
+        text = json.dumps(
+            {
+                "response": "GTVp volume is 2.592 cm³ [cite:c5].",
+                "citations": [citation],
+            }
+        )
         return Answer(text, [], [], calls).problem
 
-    assert problem({
-        "kind": "derived",
-        "cite": "c5",
-        "method": (
-            "Voxel count on the GTVp label map from the RTSTRUCT volume fetch, "
-            "multiplied by voxel volume and converted to cm³."
-        ),
-        "summary": "GTVp volume is 2.592 cm³ on the resampled label map.",
-        "result": {"value": 2.592, "unit": "cm³"},
-        "inputs": [{
-            "cite": "c5",
-            "label": "GTVp label map",
-            "detail": "roi=GTVp, spacing 2×2×2 mm",
-        }],
-    }) is None
+    assert (
+        problem(
+            {
+                "kind": "derived",
+                "cite": "c5",
+                "method": (
+                    "Voxel count on the GTVp label map from the RTSTRUCT volume fetch, "
+                    "multiplied by voxel volume and converted to cm³."
+                ),
+                "summary": "GTVp volume is 2.592 cm³ on the resampled label map.",
+                "result": {"value": 2.592, "unit": "cm³"},
+                "inputs": [
+                    {
+                        "cite": "c5",
+                        "label": "GTVp label map",
+                        "detail": "roi=GTVp, spacing 2×2×2 mm",
+                    }
+                ],
+            }
+        )
+        is None
+    )
 
     # Volume is still a DICOM fetch; imaging remains valid. derived is optional.
-    assert problem({
-        "kind": "imaging",
-        "cite": "c5",
-        "summary": "RTSTRUCT volume mask for GTVp at 2 mm spacing.",
-    }) is None
+    assert (
+        problem(
+            {
+                "kind": "imaging",
+                "cite": "c5",
+                "summary": "RTSTRUCT volume mask for GTVp at 2 mm spacing.",
+            }
+        )
+        is None
+    )
 
-    assert problem({
-        "cite": "c5",
-        "summary": "RTSTRUCT volume mask for GTVp at 2 mm spacing.",
-    }) is None
+    assert (
+        problem(
+            {
+                "cite": "c5",
+                "summary": "RTSTRUCT volume mask for GTVp at 2 mm spacing.",
+            }
+        )
+        is None
+    )
 
-    missing_method = problem({
-        "kind": "derived",
-        "cite": "c5",
-        "summary": "GTVp volume is 2.592 cm³.",
-        "inputs": [{"cite": "c5", "label": "GTVp label map"}],
-    })
+    missing_method = problem(
+        {
+            "kind": "derived",
+            "cite": "c5",
+            "summary": "GTVp volume is 2.592 cm³.",
+            "inputs": [{"cite": "c5", "label": "GTVp label map"}],
+        }
+    )
     assert missing_method and "method" in missing_method
 
-    missing_inputs = problem({
-        "kind": "derived",
-        "cite": "c5",
-        "method": "Voxel count times voxel volume.",
-        "summary": "GTVp volume is 2.592 cm³.",
-    })
+    missing_inputs = problem(
+        {
+            "kind": "derived",
+            "cite": "c5",
+            "method": "Voxel count times voxel volume.",
+            "summary": "GTVp volume is 2.592 cm³.",
+        }
+    )
     assert missing_inputs and "inputs" in missing_inputs
 
-    unknown_input = problem({
-        "kind": "derived",
-        "cite": "c5",
-        "method": "Voxel count times voxel volume.",
-        "summary": "GTVp volume is 2.592 cm³.",
-        "inputs": [{"cite": "c9", "label": "another series"}],
-    })
+    unknown_input = problem(
+        {
+            "kind": "derived",
+            "cite": "c5",
+            "method": "Voxel count times voxel volume.",
+            "summary": "GTVp volume is 2.592 cm³.",
+            "inputs": [{"cite": "c9", "label": "another series"}],
+        }
+    )
     assert unknown_input and "c9" in unknown_input
 
-    as_note = problem({
-        "kind": "note",
-        "cite": "c5",
-        "summary": "GTVp volume is 2.592 cm³.",
-    })
+    as_note = problem(
+        {
+            "kind": "note",
+            "cite": "c5",
+            "summary": "GTVp volume is 2.592 cm³.",
+        }
+    )
     assert as_note and "kind 'note'" in as_note and "'imaging'" in as_note
 
 
@@ -1794,7 +1559,12 @@ def test_a_span_fetch_is_attached_to_the_citation():
     calls = {
         "c1": {
             "tool": "fetch",
-            "arguments": {"resource_id": "note:consult", "view": "span", "start": 0, "end": 31},
+            "arguments": {
+                "resource_id": "note:consult",
+                "view": "span",
+                "start": 0,
+                "end": 31,
+            },
             "file": "consult.txt",
             "web_path": "/case/consult.txt",
             "modality": "note",
@@ -1803,21 +1573,28 @@ def test_a_span_fetch_is_attached_to_the_citation():
         },
     }
     quote_text = "Consultation for radiotherapy."
-    text = json.dumps({
-        "response": "Consultation for radiotherapy occurred on 2005-12-15 [cite:c1].",
-        "citations": [{
-            "cite": "c1",
-            "summary": "Radiotherapy consult.",
-            "evidence": [{
-                "n": 1,
-                "claim": "Consultation for radiotherapy occurred on 2005-12-15",
-                "quote": quote_text,
-                "start": 4,
-                "end": 9,
-            }],
-        }],
-    })
-    from meddataos.server.case import Answer
+    text = json.dumps(
+        {
+            "response": "Consultation for radiotherapy occurred on 2005-12-15 [cite:c1].",
+            "citations": [
+                {
+                    "cite": "c1",
+                    "summary": "Radiotherapy consult.",
+                    "evidence": [
+                        {
+                            "n": 1,
+                            "claim": "Consultation for radiotherapy occurred on 2005-12-15",
+                            "quote": quote_text,
+                            "start": 4,
+                            "end": 9,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    from meddataos.core.verifier import Answer
+
     assert Answer(text, [], [], calls).problem is None
     missing_quote = json.loads(text)
     missing_quote["citations"][0]["evidence"][0].pop("quote")
@@ -1837,7 +1614,8 @@ def test_a_span_fetch_is_attached_to_the_citation():
 
 
 def test_a_note_citation_must_quote_an_exact_slice():
-    from meddataos.server.case import Answer, case as open_case
+    from meddataos.core.verifier import Answer
+    from meddataos.server.case import case as open_case
 
     note = (
         "Patient ID: RADCURE-0006\n"
@@ -1875,17 +1653,21 @@ def test_a_note_citation_must_quote_an_exact_slice():
     start = note.find(quote)
     cited = {
         "response": "Definitive radiation alone was recommended [cite:c1].",
-        "citations": [{
-            "cite": "c1",
-            "summary": "Definitive radiation alone was recommended.",
-            "evidence": [{
-                "n": 1,
-                "claim": "Definitive radiation alone was recommended.",
-                "quote": quote,
-                "start": 1,
-                "end": 4,
-            }],
-        }],
+        "citations": [
+            {
+                "cite": "c1",
+                "summary": "Definitive radiation alone was recommended.",
+                "evidence": [
+                    {
+                        "n": 1,
+                        "claim": "Definitive radiation alone was recommended.",
+                        "quote": quote,
+                        "start": 1,
+                        "end": 4,
+                    }
+                ],
+            }
+        ],
     }
     text = json.dumps(cited)
     assert Answer(text, [], [], calls).problem is None
@@ -1898,67 +1680,92 @@ def test_a_note_citation_must_quote_an_exact_slice():
     )
 
     absent = json.loads(text)
-    absent["citations"][0]["evidence"][0]["quote"] = "chemotherapy was started yesterday"
-    assert "not in the text" in (Answer(json.dumps(absent), [], [], calls).problem or "")
+    absent["citations"][0]["evidence"][0]["quote"] = (
+        "chemotherapy was started yesterday"
+    )
+    assert "not in the text" in (
+        Answer(json.dumps(absent), [], [], calls).problem or ""
+    )
 
     missing = json.loads(text)
     missing["citations"][0].pop("evidence")
     assert "evidence" in (Answer(json.dumps(missing), [], [], calls).problem or "")
 
     whole = json.loads(text)
-    whole["citations"][0]["evidence"] = [{
-        "n": 1,
-        "claim": "The consult.",
-        "quote": note,
-        "start": 0,
-        "end": len(note),
-    }]
+    whole["citations"][0]["evidence"] = [
+        {
+            "n": 1,
+            "claim": "The consult.",
+            "quote": note,
+            "start": 0,
+            "end": len(note),
+        }
+    ]
     assert "whole note" in (Answer(json.dumps(whole), [], [], calls).problem or "")
 
 
 def test_a_note_citation_keeps_quotes_and_gains_span_links():
-    from meddataos.server.case import Answer, case as open_case
+    from meddataos.core.verifier import Answer
+    from meddataos.server.case import case as open_case
 
     calls = {
         "c1": {
             "tool": "fetch",
-            "arguments": {"resource_id": "note:completion", "view": "span", "start": 120, "end": 152},
+            "arguments": {
+                "resource_id": "note:completion",
+                "view": "span",
+                "start": 120,
+                "end": 152,
+            },
             "file": "rt-completion.txt",
             "web_path": "/case/rt-completion.txt",
             "modality": "note",
             "patient_id": "RADCURE-0006",
         },
     }
-    text = json.dumps({
-        "response": "Treatment finished on February 13 [cite:c1].",
-        "citations": [{
-            "cite": "c1",
-            "summary": "The completion note records the last treatment date.",
-            "evidence": [{
-                "n": 1,
-                "claim": "Treatment finished on February 13",
-                "quote": "Treatment completed February 13",
-                "start": 120,
-                "end": 152,
-            }],
-            "conflicts": [{
-                "attribute": "rt.end_date",
-                "severity": "high",
-                "rationale": "Two notes give different end dates.",
-                "values": [
-                    {"value": "February 13", "note_label": "rt-completion", "start": 120, "end": 152},
-                    {
-                        "value": "February 20",
-                        "note_label": "follow-up",
-                        "note_id": "note:followup",
-                        "span_url": "/api/cases/RADCURE-0006/notes/span?id=note:followup&start=40&end=51",
-                        "start": 40,
-                        "end": 51,
-                    },
-                ],
-            }],
-        }],
-    })
+    text = json.dumps(
+        {
+            "response": "Treatment finished on February 13 [cite:c1].",
+            "citations": [
+                {
+                    "cite": "c1",
+                    "summary": "The completion note records the last treatment date.",
+                    "evidence": [
+                        {
+                            "n": 1,
+                            "claim": "Treatment finished on February 13",
+                            "quote": "Treatment completed February 13",
+                            "start": 120,
+                            "end": 152,
+                        }
+                    ],
+                    "conflicts": [
+                        {
+                            "attribute": "rt.end_date",
+                            "severity": "high",
+                            "rationale": "Two notes give different end dates.",
+                            "values": [
+                                {
+                                    "value": "February 13",
+                                    "note_label": "rt-completion",
+                                    "start": 120,
+                                    "end": 152,
+                                },
+                                {
+                                    "value": "February 20",
+                                    "note_label": "follow-up",
+                                    "note_id": "note:followup",
+                                    "span_url": "/api/cases/RADCURE-0006/notes/span?id=note:followup&start=40&end=51",
+                                    "start": 40,
+                                    "end": 51,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
 
     parsed = json.loads(open_case.expand_citations(text, calls))
     citation = parsed["citations"][0]
@@ -1970,7 +1777,9 @@ def test_a_note_citation_keeps_quotes_and_gains_span_links():
     assert quote["span_url"] == (
         "/api/cases/RADCURE-0006/notes/span?id=note%3Acompletion&start=120&end=152"
     )
-    assert citation["conflicts"][0]["values"][0]["span_url"].endswith("start=120&end=152")
+    assert citation["conflicts"][0]["values"][0]["span_url"].endswith(
+        "start=120&end=152"
+    )
     assert citation["conflicts"][0]["values"][1]["span_url"].endswith("start=40&end=51")
     assert Answer(text, [], [], calls).problem is None
 
@@ -1982,10 +1791,12 @@ def test_a_note_citation_keeps_quotes_and_gains_span_links():
     bad_offsets["citations"][0]["evidence"][0]["end"] = 120
     assert Answer(json.dumps(bad_offsets), [], [], calls).problem
 
-    missing = json.dumps({
-        "response": "The tumour is contoured [cite:c9].",
-        "citations": [{"cite": "c9", "summary": "Missing."}],
-    })
+    missing = json.dumps(
+        {
+            "response": "The tumour is contoured [cite:c9].",
+            "citations": [{"cite": "c9", "summary": "Missing."}],
+        }
+    )
     assert Answer(missing, [], [], calls).problem
 
 
@@ -1996,7 +1807,13 @@ def test_describing_a_dicom_series_keeps_its_metadata():
         {"modality": "dicom", "web_path": "/case/ct"},
         "describe",
         {},
-        {"summary": {"Modality": "CT", "SeriesDescription": "Neck 2.0 CE", "roi_names": []}},
+        {
+            "summary": {
+                "Modality": "CT",
+                "SeriesDescription": "Neck 2.0 CE",
+                "roi_names": [],
+            }
+        },
     )
 
     assert record["metadata"]["Modality"] == "CT"
@@ -2005,7 +1822,7 @@ def test_describing_a_dicom_series_keeps_its_metadata():
 
 
 def test_a_fetched_file_must_be_cited_by_its_handle():
-    from meddataos.server.case import Answer
+    from meddataos.core.verifier import Answer
 
     calls = {
         "c1": {
@@ -2015,25 +1832,33 @@ def test_a_fetched_file_must_be_cited_by_its_handle():
             "web_path": "/case/clinic_note.txt",
         },
     }
-    opened = [{
-        "web_path": "/case/clinic_note.txt",
-        "id": "note:1",
-        "modality": "note",
-        "label": "clinic_note.txt",
-    }]
-    by_path = json.dumps({
-        "response": "The note records fatigue [cite:1].",
-        "citations": [{
-            "id": "1",
-            "file": "clinic_note.txt",
+    opened = [
+        {
             "web_path": "/case/clinic_note.txt",
-            "summary": "Fatigue.",
-        }],
-    })
-    by_handle = json.dumps({
-        "response": "The note records fatigue [cite:c1].",
-        "citations": [{"cite": "c1", "summary": "Fatigue."}],
-    })
+            "id": "note:1",
+            "modality": "note",
+            "label": "clinic_note.txt",
+        }
+    ]
+    by_path = json.dumps(
+        {
+            "response": "The note records fatigue [cite:1].",
+            "citations": [
+                {
+                    "id": "1",
+                    "file": "clinic_note.txt",
+                    "web_path": "/case/clinic_note.txt",
+                    "summary": "Fatigue.",
+                }
+            ],
+        }
+    )
+    by_handle = json.dumps(
+        {
+            "response": "The note records fatigue [cite:c1].",
+            "citations": [{"cite": "c1", "summary": "Fatigue."}],
+        }
+    )
 
     assert Answer(by_path, opened, [], calls).problem
     assert Answer(by_handle, opened, [], calls).problem is None
@@ -2054,7 +1879,9 @@ def test_a_cited_dicom_preview_is_a_png(tmp_path):
         assert len(paths) == 1
         assert paths[0].startswith("/case/")
         quoted = urllib.parse.quote(paths[0], safe="")
-        with urllib.request.urlopen(server["http"] + "/api/dicom/preview?web_path=" + quoted) as response:
+        with urllib.request.urlopen(
+            server["http"] + "/api/dicom/preview?web_path=" + quoted
+        ) as response:
             body = response.read()
             assert response.headers.get_content_type() == "image/png"
         assert body.startswith(b"\x89PNG\r\n\x1a\n")
@@ -2068,9 +1895,19 @@ def _specialist_case(session_id: str = "s1"):
     previous = state.report
     state.report = {
         "resources": [
-            {"id": "note:1", "modality": "note", "label": "completion", "path": "completion.txt"},
+            {
+                "id": "note:1",
+                "modality": "note",
+                "label": "completion",
+                "path": "completion.txt",
+            },
             {"id": "dicom:ct", "modality": "dicom", "label": "ct", "path": "Neck CT"},
-            {"id": "structured:labs", "modality": "structured", "label": "labs", "path": "labs.csv"},
+            {
+                "id": "structured:labs",
+                "modality": "structured",
+                "label": "labs",
+                "path": "labs.csv",
+            },
         ],
     }
     state.findings.clear()
@@ -2086,8 +1923,9 @@ def _specialist_case(session_id: str = "s1"):
 
 def _accept(session_id: str, specialist: str, reply: dict) -> dict:
     """Check a specialist reply the way a consult does, and keep its findings."""
+    from meddataos.core.verifier import Answer
     from meddataos.server import findings
-    from meddataos.server.case import Answer, case as open_case
+    from meddataos.server.case import case as open_case
 
     parsed = findings.parse_reply(json.dumps(reply))
     verdict = Answer(parsed.body, [], open_case.files(), {})
@@ -2099,33 +1937,51 @@ def test_a_finding_keeps_the_imaging_slice():
     from meddataos.server import findings
 
     with _specialist_case():
-        told = _accept("s1", "imaging", {
-            "response": "The larynx is visible [cite:1].",
-            "citations": [{
-                "id": "1", "file": "Neck CT", "web_path": "/case/Neck CT",
-                "agent": "imaging", "summary": "One axial slice shows the larynx.",
-                "preview": {"slice_index": 12, "window": "ct", "overlay": True},
-            }],
-        })
+        told = _accept(
+            "s1",
+            "imaging",
+            {
+                "response": "The larynx is visible [cite:1].",
+                "citations": [
+                    {
+                        "id": "1",
+                        "file": "Neck CT",
+                        "web_path": "/case/Neck CT",
+                        "agent": "imaging",
+                        "summary": "One axial slice shows the larynx.",
+                        "preview": {"slice_index": 12, "window": "ct", "overlay": True},
+                    }
+                ],
+            },
+        )
         reply = "The scan shows the larynx [cite:imaging.1]."
         answer = json.loads(findings.splice("s1", reply))
 
     assert told["findings"][0]["id"] == "imaging.1"
-    assert json.loads(told["result"])["response"] == "The larynx is visible [cite:imaging.1]."
+    assert (
+        json.loads(told["result"])["response"]
+        == "The larynx is visible [cite:imaging.1]."
+    )
     citation = answer["citations"][0]
     assert answer["response"] == reply
     assert (citation["id"], citation["finding"]) == ("imaging.1", "imaging.1")
     assert citation["agent"] == "imaging"
     assert citation["summary"] == "One axial slice shows the larynx."
     assert citation["dicom"] == {
-        "previews": [{
-            "web_path": "/case/Neck%20CT",
-            "slice_index": 12,
-            "window": "ct",
-            "overlay": True,
-        }],
+        "previews": [
+            {
+                "web_path": "/case/Neck%20CT",
+                "slice_index": 12,
+                "window": "ct",
+                "overlay": True,
+            }
+        ],
     }
-    assert citation["basis"] == {"type": "model_read", "checked": "none", "by": "imaging"}
+    assert citation["basis"] == {
+        "type": "model_read",
+        "checked": "none",
+        "by": "imaging",
+    }
 
 
 def test_the_routers_copy_of_a_finding_is_replaced_by_the_checked_one():
@@ -2140,25 +1996,52 @@ def test_the_routers_copy_of_a_finding_is_replaced_by_the_checked_one():
         "note_id": "note:1",
         "span_url": "/api/cases/P1/notes/span?id=note%3A1&start=120&end=151",
     }
-    conflict = {"attribute": "rt.end_date", "severity": "high", "values": [{"value": "February 13"}]}
+    conflict = {
+        "attribute": "rt.end_date",
+        "severity": "high",
+        "values": [{"value": "February 13"}],
+    }
 
     with _specialist_case():
-        _accept("s1", "notes", {
-            "response": "Treatment finished February 13 [cite:1].",
-            "citations": [{
-                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
-                "agent": "clinical_notes", "summary": "Completion note.",
-                "evidence": [checked], "conflicts": [conflict],
-            }],
-        })
-        reply = json.dumps({
-            "response": "Treatment finished in February [cite:notes.1].",
-            "citations": [{
-                "kind": "file", "id": "notes.1", "file": "completion.txt",
-                "web_path": "/case/completion.txt", "summary": "Rewritten by the router.",
-                "evidence": [{"n": 2, "claim": "Invented", "quote": "The patient was cured in full"}],
-            }],
-        })
+        _accept(
+            "s1",
+            "notes",
+            {
+                "response": "Treatment finished February 13 [cite:1].",
+                "citations": [
+                    {
+                        "id": "1",
+                        "file": "completion.txt",
+                        "web_path": "/case/completion.txt",
+                        "agent": "clinical_notes",
+                        "summary": "Completion note.",
+                        "evidence": [checked],
+                        "conflicts": [conflict],
+                    }
+                ],
+            },
+        )
+        reply = json.dumps(
+            {
+                "response": "Treatment finished in February [cite:notes.1].",
+                "citations": [
+                    {
+                        "kind": "file",
+                        "id": "notes.1",
+                        "file": "completion.txt",
+                        "web_path": "/case/completion.txt",
+                        "summary": "Rewritten by the router.",
+                        "evidence": [
+                            {
+                                "n": 2,
+                                "claim": "Invented",
+                                "quote": "The patient was cured in full",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
         answer = json.loads(findings.splice("s1", reply))
 
     (citation,) = answer["citations"]
@@ -2166,29 +2049,50 @@ def test_the_routers_copy_of_a_finding_is_replaced_by_the_checked_one():
     assert citation["summary"] == "Completion note."
     assert citation["conflicts"] == [conflict]
     assert citation["evidence"] == [checked]
-    assert citation["basis"] == {"type": "quote", "checked": "specialist", "by": "notes"}
+    assert citation["basis"] == {
+        "type": "quote",
+        "checked": "specialist",
+        "by": "notes",
+    }
 
 
 def test_a_router_cannot_mark_its_own_citation_as_a_finding():
+    from meddataos.core.verifier import Answer
     from meddataos.server import findings
-    from meddataos.server.case import Answer, case as open_case
+    from meddataos.server.case import case as open_case
 
     with _specialist_case():
-        _accept("s1", "notes", {
-            "response": "Treatment finished February 13 [cite:1].",
-            "citations": [{
-                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
-                "summary": "Completion note.",
-            }],
-        })
-        forged = json.dumps({
-            "response": "The patient was cured [cite:x].",
-            "citations": [{
-                "kind": "file", "id": "x", "file": "labs.csv", "web_path": "/case/labs.csv",
-                "summary": "Invented.", "finding": "notes.1",
-                "basis": {"type": "cell", "checked": "server", "by": "notes"},
-            }],
-        })
+        _accept(
+            "s1",
+            "notes",
+            {
+                "response": "Treatment finished February 13 [cite:1].",
+                "citations": [
+                    {
+                        "id": "1",
+                        "file": "completion.txt",
+                        "web_path": "/case/completion.txt",
+                        "summary": "Completion note.",
+                    }
+                ],
+            },
+        )
+        forged = json.dumps(
+            {
+                "response": "The patient was cured [cite:x].",
+                "citations": [
+                    {
+                        "kind": "file",
+                        "id": "x",
+                        "file": "labs.csv",
+                        "web_path": "/case/labs.csv",
+                        "summary": "Invented.",
+                        "finding": "notes.1",
+                        "basis": {"type": "cell", "checked": "server", "by": "notes"},
+                    }
+                ],
+            }
+        )
         spliced = findings.splice("s1", forged)
         (citation,) = json.loads(spliced)["citations"]
         verdict = Answer(spliced, [], open_case.files(), {}, findings.known("s1"))
@@ -2200,24 +2104,39 @@ def test_a_router_cannot_mark_its_own_citation_as_a_finding():
 
 
 def test_a_marker_for_a_finding_that_does_not_exist_is_refused():
+    from meddataos.core.verifier import Answer
     from meddataos.server import findings
-    from meddataos.server.case import Answer, case as open_case
+    from meddataos.server.case import case as open_case
 
     with _specialist_case():
-        _accept("s1", "notes", {
-            "response": "Treatment finished February 13 [cite:1].",
-            "citations": [{
-                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
-                "summary": "Completion note.",
-            }],
-        })
-        reply = "It finished in February [cite:notes.1]. The dose was 51 Gy [cite:notes.7]."
+        _accept(
+            "s1",
+            "notes",
+            {
+                "response": "Treatment finished February 13 [cite:1].",
+                "citations": [
+                    {
+                        "id": "1",
+                        "file": "completion.txt",
+                        "web_path": "/case/completion.txt",
+                        "summary": "Completion note.",
+                    }
+                ],
+            },
+        )
+        reply = (
+            "It finished in February [cite:notes.1]. The dose was 51 Gy [cite:notes.7]."
+        )
         spliced = findings.splice("s1", reply)
         verdict = Answer(spliced, [], open_case.files(), {}, findings.known("s1"))
-        plain = Answer("It finished in February.", [], open_case.files(), {}, findings.known("s1"))
+        plain = Answer(
+            "It finished in February.", [], open_case.files(), {}, findings.known("s1")
+        )
 
     assert verdict.problem == "[cite:notes.7] is not a finding. Findings: notes.1."
-    assert plain.problem.startswith("The reply cites nothing, but specialists returned findings")
+    assert plain.problem.startswith(
+        "The reply cites nothing, but specialists returned findings"
+    )
 
 
 def test_a_reply_that_cites_no_finding_is_left_alone():
@@ -2232,13 +2151,26 @@ def test_a_reply_that_cites_no_finding_is_left_alone():
 def test_a_specialist_may_abstain_or_state_a_need_without_citing():
     from meddataos.server import findings
 
-    reply = findings.parse_reply(json.dumps({
-        "response": "Child-Pugh cannot be computed from the tables alone.",
-        "citations": [],
-        "needs": [{"what": "ascites: none, mild, or moderate to severe", "why": "Child-Pugh"}, "encephalopathy grade"],
-        "abstentions": ["No ammonia level in the tables."],
-        "facts": [{"key": "Lab.AFP", "value": 6.0, "cite": "c1"}, {"key": "", "value": 1, "cite": "c1"}],
-    }))
+    reply = findings.parse_reply(
+        json.dumps(
+            {
+                "response": "Child-Pugh cannot be computed from the tables alone.",
+                "citations": [],
+                "needs": [
+                    {
+                        "what": "ascites: none, mild, or moderate to severe",
+                        "why": "Child-Pugh",
+                    },
+                    "encephalopathy grade",
+                ],
+                "abstentions": ["No ammonia level in the tables."],
+                "facts": [
+                    {"key": "Lab.AFP", "value": 6.0, "cite": "c1"},
+                    {"key": "", "value": 1, "cite": "c1"},
+                ],
+            }
+        )
+    )
 
     assert reply.body == "Child-Pugh cannot be computed from the tables alone."
     assert reply.needs == [
@@ -2249,7 +2181,8 @@ def test_a_specialist_may_abstain_or_state_a_need_without_citing():
     assert reply.facts == [{"key": "lab.afp", "value": 6.0, "cite": "c1"}]
 
     with _specialist_case():
-        from meddataos.server.case import Answer, case as open_case
+        from meddataos.core.verifier import Answer
+        from meddataos.server.case import case as open_case
 
         verdict = Answer(reply.body, [], open_case.files(), {})
         told = findings.accept("s1", "tabular", reply, reply.body, verdict)
@@ -2263,42 +2196,64 @@ def test_discrepancies_have_to_name_findings_the_server_holds():
     from meddataos.server import findings
 
     with _specialist_case():
-        _accept("s1", "notes", {
-            "response": "The note says never smoked [cite:1].",
-            "citations": [{
-                "id": "1", "file": "completion.txt", "web_path": "/case/completion.txt",
-                "agent": "clinical_notes", "summary": "Never smoked.",
-            }],
-        })
-        _accept("s1", "tabular", {
-            "response": "The registry row says current smoker [cite:1].",
-            "citations": [{
-                "id": "1", "file": "labs.csv", "web_path": "/case/labs.csv",
-                "summary": "Smoking Status is Current.",
-            }],
-        })
-        text = findings.splice("s1", json.dumps({
-            "response": "Smoking status is disputed [cite:notes.1].",
-            "citations": [],
-            "discrepancies": [
+        _accept(
+            "s1",
+            "notes",
+            {
+                "response": "The note says never smoked [cite:1].",
+                "citations": [
+                    {
+                        "id": "1",
+                        "file": "completion.txt",
+                        "web_path": "/case/completion.txt",
+                        "agent": "clinical_notes",
+                        "summary": "Never smoked.",
+                    }
+                ],
+            },
+        )
+        _accept(
+            "s1",
+            "tabular",
+            {
+                "response": "The registry row says current smoker [cite:1].",
+                "citations": [
+                    {
+                        "id": "1",
+                        "file": "labs.csv",
+                        "web_path": "/case/labs.csv",
+                        "summary": "Smoking Status is Current.",
+                    }
+                ],
+            },
+        )
+        text = findings.splice(
+            "s1",
+            json.dumps(
                 {
-                    "attribute": "social_history.smoking",
-                    "rationale": "The registry row and the note disagree.",
-                    "values": [
-                        {"value": "Never smoked", "finding": "notes.1"},
-                        {"value": "Current", "finding": "tabular.1"},
+                    "response": "Smoking status is disputed [cite:notes.1].",
+                    "citations": [],
+                    "discrepancies": [
+                        {
+                            "attribute": "social_history.smoking",
+                            "rationale": "The registry row and the note disagree.",
+                            "values": [
+                                {"value": "Never smoked", "finding": "notes.1"},
+                                {"value": "Current", "finding": "tabular.1"},
+                            ],
+                            "preferred": "tabular.1",
+                        },
+                        {
+                            "attribute": "tumor.size_cm",
+                            "values": [
+                                {"value": "3.2", "finding": "notes.1"},
+                                {"value": "9.9", "finding": "imaging.4"},
+                            ],
+                        },
                     ],
-                    "preferred": "tabular.1",
-                },
-                {
-                    "attribute": "tumor.size_cm",
-                    "values": [
-                        {"value": "3.2", "finding": "notes.1"},
-                        {"value": "9.9", "finding": "imaging.4"},
-                    ],
-                },
-            ],
-        }))
+                }
+            ),
+        )
         answer = json.loads(findings.keep_discrepancies("s1", text))
 
     (kept,) = answer["discrepancies"]
@@ -2314,29 +2269,41 @@ def test_a_citation_that_names_no_agent_gets_the_one_for_its_file():
     from meddataos.server.case import case as open_case
 
     with _specialist_case():
-        text = json.dumps({
-            "response": "Notes [cite:1]. Labs [cite:2]. Scan [cite:3]. Slice [cite:4].",
-            "citations": [
-                {"id": "1", "web_path": "/case/completion.txt", "agent": None},
-                {"id": "2", "web_path": "/case/labs.csv"},
-                {"id": "3", "web_path": "/case/Neck%20CT"},
-                {"id": "4", "web_path": "/case/Neck%20CT", "dicom": {"previews": [{}]}},
-            ],
-        })
+        text = json.dumps(
+            {
+                "response": "Notes [cite:1]. Labs [cite:2]. Scan [cite:3]. Slice [cite:4].",
+                "citations": [
+                    {"id": "1", "web_path": "/case/completion.txt", "agent": None},
+                    {"id": "2", "web_path": "/case/labs.csv"},
+                    {"id": "3", "web_path": "/case/Neck%20CT"},
+                    {
+                        "id": "4",
+                        "web_path": "/case/Neck%20CT",
+                        "dicom": {"previews": [{}]},
+                    },
+                ],
+            }
+        )
 
         citations = json.loads(open_case.name_sources(text, {}))["citations"]
 
     assert [item.get("agent") for item in citations] == [
-        "clinical_notes", "structured", "imaging", None,
+        "clinical_notes",
+        "structured",
+        "imaging",
+        None,
     ]
 
 
 def test_a_discrepancy_card_from_a_specialist_passes_the_answer_schema():
-    import meddataos.server.answer as answer
+    import meddataos.core.verifier.schema as answer
 
     citation = {
-        "kind": "file", "id": "d1", "file": "followup.txt",
-        "web_path": "/case/followup.txt", "summary": "Follow-up note.",
+        "kind": "file",
+        "id": "d1",
+        "file": "followup.txt",
+        "web_path": "/case/followup.txt",
+        "summary": "Follow-up note.",
         "evidence": [{"n": "d1", "claim": "February 20", "quote": "ended February 20"}],
     }
     assert answer.shape_problem(citation, None) is None

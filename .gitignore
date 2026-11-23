@@ -87,3 +87,6 @@ CLAUDE.md
 
 # MkDocs build
 site/
+
+# MCP servers registered for this checkout only (pixi run mcp add, local scope)
+configs/mcp.local.json

@@ -2,7 +2,7 @@
 
 ## North star
 
-Build a **local medical data access harness**: open a filesystem root, auto-discover DICOM / structured data / clinical notes, and expose a small Discover → Describe → Fetch API that humans and LLMs can use.
+Build a **local medical data controller**: open a filesystem root, auto-discover DICOM / structured data / clinical notes, and expose a small Discover → Describe → Fetch API that humans and LLMs can use.
 
 Success means an agent can **inventory a case and pull only what it needs**, not that we build an EHR, PACS, or clinical decision system.
 
@@ -13,7 +13,7 @@ Success means an agent can **inventory a case and pull only what it needs**, not
 - Local directory as the unit of work (any layout; auto-discover)
 - Three modalities: DICOM (via med-imagetools), structured tables/records, clinical notes
 - DICOM cross-series references (SEG/RTSTRUCT/etc. ↔ parent CT/MR/PT) via imagetools Interlacer; agents pick series from inventory / `dicom_tree` / `dicom_groups`, not NL ranking
-- DICOM ingest and previews via med-imagetools crawl + `Scan`; harness code in `datactrl.utils` (`dicom_crawl`, `dicom_meta`, `dicom_views`, `rtstruct`, `seg`)
+- DICOM ingest and previews via med-imagetools crawl + `Scan`; helper code in `datactrl.utils` (`dicom_crawl`, `dicom_meta`, `dicom_views`, `rtstruct`, `seg`)
 - RTSTRUCT (`RTStructureSet`) and SEG (`SEG`) ROI inventory, with single-slice outlines on the referenced CT/MR/PT
 - Progressive disclosure: list → describe/schema → bounded fetch
 - Stable resource IDs, clear errors, size/row/char limits by default

@@ -9,27 +9,26 @@ version = "0.2.0"
 python = ">=3.13,<3.14"
 
 [pypi-dependencies]
-meddataos = { path = ".", editable = true, extras = ["datactrl", "server", "specialists", "orchestrator", "dicom"] }
+meddataos = { path = ".", editable = true, extras = ["datactrl", "server"] }
 
 [environments]
 default = ["style", "docs"]
 library = { features = ["library"], no-default-feature = true }
-# The Python the DICOM specialist's sandbox runs. Kept apart from the server env.
+# The Python the harness sandbox runs (exec). Kept apart from the server env.
 dicom-sandbox = { features = ["dicom-sandbox"], no-default-feature = true }
+# TotalSegmentator as an MCP server (servers/totalseg). Torch and nnU-Net stay out of the server env.
+totalseg = { features = ["totalseg"], no-default-feature = true }
 
 [tasks]
-stack = { cmd = "python scripts/stack.py", description = "Start the router, specialists, and web server for one case" }
-serve = "python -m meddataos.server"
+serve = { cmd = "python -m meddataos.server", description = "Serve one case with the harness: pixi run serve <case>" }
 agent = "python examples/agent.py"
-orchestrator = "python -m meddataos.orchestrator.serve"
-notes = "python -m meddataos.specialists.notes.serve"
-tabular = "python -m meddataos.specialists.tabular.serve"
-dicom = { cmd = "python -m meddataos.specialists.dicom.serve", depends-on = ["dicom-sandbox-install"], description = "Serve the DICOM specialist (OpenAI Agents SDK)" }
-dicom-sandbox-install = { cmd = "pixi install -e dicom-sandbox", description = "Install the DICOM sandbox Python environment" }
+dicom-sandbox-install = { cmd = "pixi install -e dicom-sandbox", description = "Install the Python environment the harness sandbox mounts" }
 test = "pytest tests"
+mcp = { cmd = "python -m meddataos.harness.mcp_cli", description = "Register, list, inspect, remove and trust MCP servers: pixi run mcp --help" }
+eval = { cmd = "python -m meddataos.evals.run", description = "Ask the eval questions through the server and score the answers" }
 
 ############################################## STYLE ###############################################
-# Style covers datactrl and the server. Specialists are not in this gate yet.
+# Style covers datactrl, the server, evals and the harness. Specialists are not in this gate yet.
 # See configs/ruff.toml for the configuration.
 
 [feature.style.pypi-dependencies]
@@ -38,11 +37,11 @@ ruff = ">=0.4.4"
 mypy = ">=1.15.0,<2"
 
 [feature.style.tasks]
-ruff-check.cmd = ["ruff", "check", "src/meddataos/datactrl", "src/meddataos/server"]
+ruff-check.cmd = ["ruff", "check", "src/meddataos/core", "src/meddataos/server", "src/meddataos/evals", "src/meddataos/harness", "servers"]
 ruff-check.description = "Run ruff check"
-ruff-format.cmd = ["ruff", "format", "--check", "src/meddataos/datactrl", "src/meddataos/server"]
+ruff-format.cmd = ["ruff", "format", "--check", "src/meddataos/core", "src/meddataos/server", "src/meddataos/evals", "src/meddataos/harness", "servers"]
 ruff-format.description = "Check ruff format"
-type-check.cmd = ["mypy", "-p", "meddataos.datactrl", "-p", "meddataos.server"]
+type-check.cmd = ["mypy", "-p", "meddataos.core", "-p", "meddataos.server", "-p", "meddataos.evals", "-p", "meddataos.harness"]
 type-check.description = "Run mypy type check"
 qc.depends-on = ["ruff-format", "ruff-check", "type-check"]
 qc.description = "Quality check: ruff & mypy"
@@ -61,7 +60,7 @@ python = ">=3.13,<3.14"
 meddataos = { path = ".", editable = true, extras = ["datactrl"] }
 
 ############################################ DICOM SANDBOX #########################################
-# Packages the DICOM specialist can use in its sandbox shell. Add model runtimes here later.
+# Packages code run with exec in the harness sandbox can use. Add model runtimes here later.
 
 [feature.dicom-sandbox.dependencies]
 python = ">=3.13,<3.14"
@@ -73,3 +72,20 @@ pydicom = "*"
 scikit-image = "*"
 pandas = "*"
 matplotlib-base = "*"
+
+############################################# TOTALSEG #############################################
+# The TotalSegmentator MCP server. CPU torch from conda-forge: the PyPI wheel brings CUDA libraries.
+# Weights are not downloaded here; the server reads them from TOTALSEG_WEIGHTS_PATH.
+
+[feature.totalseg.dependencies]
+python = "3.12.*"
+pytorch-cpu = "*"
+# From conda-forge too: the PyPI wheel is built against another torch and fails to load.
+torchvision = "*"
+
+[feature.totalseg.pypi-dependencies]
+totalsegmentator = ">=2.4,<3"
+mcp = ">=2.3,<3"
+
+[feature.totalseg.tasks]
+totalseg-mcp = { cmd = "python servers/totalseg/server.py", description = "Run the TotalSegmentator MCP server over stdio" }

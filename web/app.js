@@ -1827,7 +1827,7 @@ function stepSummary(steps, live) {
     )).length;
     const tools = steps.filter(step => step.kind === 'tool').length;
     const consults = [...new Set(
-        steps.filter(step => step.kind === 'consult' && step.name).map(step => step.name)
+        steps.filter(step => isSubagentStep(step) && step.name).map(step => step.name)
     )];
     const parts = [];
 
@@ -1836,7 +1836,10 @@ function stepSummary(steps, live) {
     else if (!live && tools === 1) parts.push('1 tool call');
     else if (!live && tools > 1) parts.push(`${tools} tool calls`);
 
-    if (consults.length) parts.push(`consulted ${consults.join(', ')}`);
+    if (consults.length) {
+        const noun = consults.length === 1 ? 'subagent' : 'subagents';
+        parts.push(`ran the ${consults.join(', ')} ${noun}`);
+    }
 
     return parts.join(' · ');
 }
@@ -1849,9 +1852,14 @@ function workedLabel(steps, durationMs) {
     return detail ? `${head} · ${detail}` : head;
 }
 
+// Subagent runs; chats saved before subagents were named still say "consult".
+function isSubagentStep(step) {
+    return step.kind === 'subagent' || step.kind === 'consult';
+}
+
 function stepKind(step) {
     if (step.kind === 'agent') return 'Think';
-    if (step.kind === 'consult') return 'Consult';
+    if (isSubagentStep(step)) return 'Subagent';
     return {
         discover: 'Discover',
         fetch: 'Read',
@@ -1865,7 +1873,7 @@ function stepKind(step) {
 
 function stepTarget(step) {
     if (step.kind === 'agent') return step.label || '';
-    if (step.kind === 'consult') return step.name || '';
+    if (isSubagentStep(step)) return step.name || '';
 
     const prefixes = {
         discover: 'Discovering the case',
@@ -1903,42 +1911,149 @@ function stepCite(step) {
     return token || type;
 }
 
-function stepRow(step, showKind) {
-    const kind = ['tool', 'consult'].includes(step.kind) ? step.kind : 'tool';
-    const cite = escapeHtml(stepCite(step));
-    const time = stepStatus(step) === 'started' || !(step.duration_ms >= 100)
+function stepTime(step) {
+    return stepStatus(step) === 'started' || !(step.duration_ms >= 100)
         ? ''
         : formatDuration(step.duration_ms);
+}
+
+function stepRow(step, showKind) {
+    const kind = isSubagentStep(step) ? 'subagent' : 'tool';
+    // What the call did, or why it failed: the view and ROI read, what exec
+    // printed, the image looked at.
+    const note = step.detail
+        ? `<span class="step-note">${escapeHtml(String(step.detail))}</span>`
+        : '';
     return `<li class="step step-${stepStatus(step)} step-${kind}" data-step-id="${escapeHtml(String(step.step_id || ''))}">
         <span class="step-mark"></span>
         <span class="step-kind">${showKind ? escapeHtml(stepKind(step)) : ''}</span>
         <span class="step-label">${escapeHtml(stepTarget(step))}</span>
-        <span class="step-cite">${cite}</span>
-        <span class="step-time">${escapeHtml(time)}</span>
+        <span class="step-cite">${escapeHtml(stepCite(step))}</span>
+        <span class="step-time">${escapeHtml(stepTime(step))}</span>
+        ${note}
     </li>`;
 }
 
-function stepRows(steps) {
+// Rows with the kind shown only where it changes, so runs of reads read as one.
+function flatRows(steps) {
     let previous = '';
     return steps.map(step => {
         const kind = stepKind(step);
         const showKind = kind !== previous;
         previous = kind;
-        const detail = MedEvidence.consultDetail(step);
-        const open = openConsultDetails.has(String(step.step_id)) ? ' open' : '';
-        return stepRow(step, showKind) + (detail
-            ? `<li class="step-detail" data-detail-for="${escapeHtml(String(step.step_id || ''))}"><details${open}><summary>Asked and replied</summary>${detail}</details></li>`
-            : '');
+        return stepRow(step, showKind);
     }).join('');
 }
 
-// Consult details the reader opened, kept open while the live list repaints.
-const openConsultDetails = new Set();
+// Split steps into the router's own and those each subagent run made, by the
+// run's step id. Chats saved before steps named their run fall back to the
+// subagent's name.
+function groupSteps(steps) {
+    const runs = steps.filter(isSubagentStep);
+    const runIds = new Set(runs.map(run => String(run.step_id)));
+    const firstRunByName = new Map();
+    runs.forEach(run => {
+        if (!firstRunByName.has(run.name)) firstRunByName.set(run.name, String(run.step_id));
+    });
+
+    const top = [];
+    const children = new Map();
+    steps.forEach(step => {
+        let parent = step.parent && runIds.has(String(step.parent)) ? String(step.parent) : '';
+        if (!parent && step.by && !isSubagentStep(step)) parent = firstRunByName.get(step.by) || '';
+
+        if (!parent) {
+            top.push(step);
+            return;
+        }
+        if (!children.has(parent)) children.set(parent, []);
+        children.get(parent).push(step);
+    });
+    return { top, children };
+}
+
+function plural(count, word) {
+    return `${count} ${word}${count === 1 ? '' : 's'}`;
+}
+
+// "4 reads · 2 runs · 3 images · 1 failed · 3 findings" for a run's header.
+function runCounts(run, children) {
+    const count = test => children.filter(test).length;
+    const reads = count(step => step.name === 'fetch' || step.name === 'describe');
+    const execs = count(step => step.name === 'exec');
+    const images = count(step => step.name === 'view_image');
+    const failed = count(step => stepStatus(step) === 'error');
+    const parts = [];
+    if (reads) parts.push(plural(reads, 'read'));
+    if (execs) parts.push(plural(execs, 'run'));
+    if (images) parts.push(plural(images, 'image'));
+    if (failed) parts.push(`${failed} failed`);
+    if (run.findings) parts.push(plural(run.findings, 'finding'));
+    return parts.join(' · ');
+}
+
+function subagentGroup(run, children) {
+    const id = String(run.step_id || '');
+    const status = stepStatus(run);
+    // Open while it runs, and afterwards when the reader opened it.
+    const open = status === 'started' || openRuns.has(id) ? ' open' : '';
+    const reply = String(run.reply || '')
+        .replace(/\[cite:[^\]]+\]/g, '')
+        .replace(/\s+([.,;])/g, '$1');
+    const line = (label, value, cls = '') => value
+        ? `<div class="run-line ${cls}"><span class="run-label">${label}</span><span class="run-text">${escapeHtml(String(value))}</span></div>`
+        : '';
+    const list = (label, items, cls) => Array.isArray(items) && items.length
+        ? line(label, items.join('; '), cls)
+        : '';
+    const steps = children.length
+        ? `<ol class="step-list run-steps">${flatRows(children)}</ol>`
+        : '';
+
+    return `<li class="step-group" data-step-id="${escapeHtml(id)}">
+        <details${open}>
+            <summary class="step step-${status} step-subagent">
+                <span class="step-mark"></span>
+                <span class="step-kind">Subagent</span>
+                <span class="step-label">${escapeHtml(run.name || '')}</span>
+                <span class="step-cite">${escapeHtml(runCounts(run, children))}</span>
+                <span class="step-time">${escapeHtml(stepTime(run))}</span>
+            </summary>
+            <div class="run-body">
+                ${line('Task', run.question)}
+                ${line('With', run.context, 'run-context')}
+                ${steps}
+                ${line(status === 'error' ? 'Failed' : 'Replied', reply, status === 'error' ? 'run-failed' : '')}
+                ${list('Needs', run.needs, 'run-needs')}
+                ${list('Not documented', run.abstentions, 'run-abstain')}
+            </div>
+        </details>
+    </li>`;
+}
+
+// The router's steps in order, each subagent run as a group holding its own.
+function stepRows(steps) {
+    const { top, children } = groupSteps(steps);
+    let previous = '';
+    return top.map(step => {
+        if (isSubagentStep(step)) {
+            previous = '';
+            return subagentGroup(step, children.get(String(step.step_id)) || []);
+        }
+        const kind = stepKind(step);
+        const showKind = kind !== previous;
+        previous = kind;
+        return stepRow(step, showKind);
+    }).join('');
+}
+
+// Subagent groups the reader opened, kept open while the live list repaints.
+const openRuns = new Set();
 document.addEventListener('toggle', (e) => {
-    const row = e.target.closest ? e.target.closest('.step-detail') : null;
-    if (!row) return;
-    if (e.target.open) openConsultDetails.add(row.dataset.detailFor);
-    else openConsultDetails.delete(row.dataset.detailFor);
+    const group = e.target.parentElement;
+    if (!group || !group.classList || !group.classList.contains('step-group')) return;
+    if (e.target.open) openRuns.add(group.dataset.stepId);
+    else openRuns.delete(group.dataset.stepId);
 }, true);
 
 function renderStepTrace(steps, durationMs) {

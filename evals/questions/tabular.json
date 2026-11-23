@@ -1,0 +1,73 @@
+[
+  {
+    "id": "tab-afp-peak",
+    "patient_id": "SYN-EVAL-01",
+    "type": "extreme",
+    "question": "What was the highest AFP and when was it drawn?",
+    "expect": [["re:\\b42(\\.0)?\\b"], ["date:2020-07-22", "july 22", "jul 22"]]
+  },
+  {
+    "id": "tab-afp-trend",
+    "patient_id": "SYN-EVAL-01",
+    "type": "trend",
+    "question": "How did AFP change from the first draw to the last?",
+    "expect": [["8.2"], ["27.3"]]
+  },
+  {
+    "id": "tab-platelets-lowest",
+    "patient_id": "SYN-EVAL-01",
+    "type": "correction",
+    "question": "What was the lowest platelet count?",
+    "expect": [["118"]]
+  },
+  {
+    "id": "tab-albi-baseline",
+    "patient_id": "SYN-EVAL-01",
+    "type": "score",
+    "question": "What was the ALBI score and grade at baseline on 2020-01-15?",
+    "expect": [["-2.39", "−2.39"], ["grade 2"]]
+  },
+  {
+    "id": "tab-meld",
+    "patient_id": "SYN-EVAL-01",
+    "type": "score",
+    "question": "What was the MELD score on 2020-07-22?",
+    "expect": [["re:\\b17\\b"]]
+  },
+  {
+    "id": "tab-child-pugh",
+    "patient_id": "SYN-EVAL-01",
+    "type": "cross-source score",
+    "question": "What was the Child-Pugh score at the October 2020 visit?",
+    "expect": [["re:\\b6\\b"], ["class a", "child-pugh a", "child pugh a"]]
+  },
+  {
+    "id": "tab-bmi",
+    "patient_id": "SYN-EVAL-01",
+    "type": "score",
+    "question": "What was the BMI in January 2020?",
+    "expect": [["26.8"]]
+  },
+  {
+    "id": "tab-weight-change",
+    "patient_id": "SYN-EVAL-01",
+    "type": "trend",
+    "question": "How much weight did the patient lose during 2020?",
+    "expect": [["5.5"]]
+  },
+  {
+    "id": "tab-interval",
+    "patient_id": "SYN-EVAL-01",
+    "type": "interval",
+    "question": "How many days were there between the first and the last lab draw?",
+    "expect": [["278"]]
+  },
+  {
+    "id": "tab-hba1c-absent",
+    "patient_id": "SYN-EVAL-01",
+    "type": "abstention",
+    "question": "What was the hemoglobin A1c?",
+    "expect": [],
+    "expect_abstain": true
+  }
+]

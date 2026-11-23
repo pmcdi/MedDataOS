@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "totalseg": {
+      "command": "python",
+      "args": [
+        "servers/totalseg/server.py"
+      ],
+      "env": {
+        "TOTALSEG_WEIGHTS_PATH": "/weights"
+      },
+      "meddataos": {
+        "evidence": "derived",
+        "timeout": 1800,
+        "sandbox": true,
+        "python_env": ".pixi/envs/totalseg",
+        "mounts": [
+          "~/.totalsegmentator/nnunet/results:/weights:ro"
+        ],
+        "memory": "12g",
+        "cpus": "12"
+      }
+    }
+  }
+}

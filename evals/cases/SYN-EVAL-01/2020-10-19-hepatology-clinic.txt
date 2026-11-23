@@ -1,0 +1,15 @@
+HEPATOLOGY CLINIC NOTE
+Synthetic patient for MedDataOS evals. Not a real person.
+DOS: 2020-10-19
+
+HPI: 58-year-old man with hepatitis C cirrhosis and hepatocellular carcinoma,
+seen for follow-up after his July labs. Reports mild fatigue. No confusion,
+no melena, no abdominal swelling.
+
+Exam: Alert and oriented x3. No asterixis. Abdomen soft, no ascites
+appreciated, no shifting dullness.
+
+Assessment: Compensated cirrhosis. No hepatic encephalopathy. No ascites.
+AFP rose over the summer and has come down since.
+
+Plan: Repeat labs in three months. Continue surveillance imaging.

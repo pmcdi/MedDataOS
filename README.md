@@ -1,98 +1,45 @@
 # MedDataOS
 
-A local page for asking questions about the files in one folder. The server opens that folder with [datactrl](docs/datactrl/README.md), serves the files, and sends each question to an OpenAI-compatible chat completions endpoint. That endpoint is the agent: the example in `examples/agent.py`, or any other program that speaks the same API.
+MedDataOS answers questions about one patient's files. Point it at a folder of clinical notes, lab tables and DICOM studies, open the page, and ask. Each answer cites the files it used, and the server checks every citation against what was actually read before you see it: a quote must be in the note, a lab value must be the cell it names, a number must be one the read returned.
 
-One process opens one folder. Chat sessions, pins, review checkboxes, and audit runs are saved in SQLite under `data/cases/` for that folder path and come back when you reopen the same case. Restart the server to open a different folder.
+Everything runs locally. The model can be Azure OpenAI, OpenAI, or a local OpenAI-compatible server.
 
-## Layout
+## Quick start
+
+You need [pixi](https://pixi.sh) and a model that takes function tools.
+
+```bash
+pixi install
+cp .env.example .env        # then set AZURE_OPENAI_* or OPENAI_*
+pixi run serve evals/cases/SYN-EVAL-01
+```
+
+Open the URL it prints and ask "What was the highest AFP and when was it drawn?". [Get started](docs/getting-started.md) walks through it, including what to expect.
+
+## Documentation
+
+| | |
+|---|---|
+| [Get started](docs/getting-started.md) | Install, connect a model, ask your first question |
+| [Use the page](docs/using-the-page.md) | Asking, reading cited answers, the trace, pins, reviews, the audit export |
+| [How it works](docs/concepts/how-it-works.md) and [Cited answers](docs/concepts/citations.md) | What happens to a question, and what makes an answer pass |
+| Guides | [Connect a model](docs/guides/models.md), [the sandbox](docs/guides/sandbox.md), [TotalSegmentator](docs/guides/totalsegmentator.md), [MCP servers](docs/guides/mcp-servers.md), [skills](docs/guides/skills.md), [agents](docs/guides/agents.md), [an external agent](docs/guides/external-agent.md), [evals](docs/guides/evals.md), [troubleshooting](docs/guides/troubleshooting.md) |
+| Reference | [Settings](docs/reference/settings.md), [harness config](docs/reference/harness-config.md), [tools](docs/reference/tools.md), [answer format](docs/reference/answer-format.md), [agent protocol](docs/reference/agent-protocol.md), [HTTP API](docs/reference/http-api.md), [storage](docs/reference/storage.md), [datactrl](docs/datactrl/README.md) |
+| Development | [Code map](docs/development/architecture.md), [testing](docs/development/testing.md) |
+
+`pixi run docs` serves the documentation locally; a push to `main` publishes it to GitHub Pages.
+
+## Repository
 
 | Path | Contents |
-|------|----------|
-| `web/` | The page. See [the page](docs/page.md). |
-| `src/meddataos/` | The package: `datactrl` (case access; see [datactrl](docs/datactrl/README.md)), `server`, `specialists` (notes, imaging, tabular), and `orchestrator` (the router used by `pixi run stack`). |
-| `examples/agent.py` | The example router: passes each request to the model. |
-| `configs/agents.toml` | Registers the specialists with the server. |
-| `scripts/stack.py` | Starts the router, specialists, and server together. |
-| `tests/` | `server/`, `datactrl/`, and `specialists/`. |
-| `docs/` | This site's pages. `pixi run docs` serves them. A push to `main` publishes them to GitHub Pages. |
-
-## Start
-
-Copy `.env.example` to `.env`.
-
-To use the example agent, set `OPENAI_MODEL`. Set `OPENAI_API_KEY` when the model requires one. `OPENAI_BASE_URL` is the model's base URL, the part before `/chat/completions`. The example agent calls `https://api.openai.com/v1` only when `OPENAI_BASE_URL` is unset. A blank value does not use that default, so set the URL or remove the line.
-
-To run everything for one case, the orchestrator, the notes, DICOM, and tabular specialists from `configs/agents.toml`, and the server:
-
-```bash
-pixi run stack data/TCGA-DD-A4NF
-```
-
-Each process's output is prefixed with its name, and Ctrl-C stops them all. `--only notes` starts a subset. `--router example` uses the example agent as the router instead of the orchestrator. The specialists need `GEMINI_API_KEY` or the Azure settings in `.env`. The steps below start the agent and the server by hand.
-
-In one terminal:
-
-```bash
-pixi run agent
-```
-
-That serves `examples/agent.py` at `http://127.0.0.1:8001/v1` and prints the address to pass below. It forwards each request to `OPENAI_MODEL` and returns the model's message, including any tool calls.
-
-In another terminal, pass the folder and that address:
-
-```bash
-pixi run serve /path/to/folder --agent-url http://127.0.0.1:8001/v1
-```
-
-The server refuses to start without `--agent-url`. Open the URL it prints. The query `?patient=` is the folder name, which is the only patient on the page.
-
-To skip the example agent, point `--agent-url` at another chat completions endpoint, such as `http://127.0.0.1:11434/v1` for Ollama. The server sends `AGENT_MODEL` as `model`, `AGENT_API_KEY` as a bearer token when it is set, and waits `AGENT_TIMEOUT` seconds (default `120`). The example agent ignores `AGENT_MODEL` and uses `OPENAI_MODEL` instead.
-
-`HOST` and `PORT` bind the page. The defaults are `127.0.0.1` and `8080`.
-
-`pixi run test` starts the server on a small folder and talks to it as the page, as an agent, and as a model behind the example agent. It also runs the datactrl and specialist tests.
-
-## What a question goes through
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Page
-    participant Server as MedDataOS server
-    participant Agent as Agent at --agent-url
-    participant Folder as Case folder
-
-    User->>Page: Ask a question
-    Page->>Server: POST /api/chat
-    Server->>Agent: Chat so far, file list, citation rule, tools
-    loop Until the agent stops calling tools, at most 16 rounds
-        Agent-->>Server: Tool call
-        Server->>Folder: Run it with datactrl
-        Server->>Page: step
-        Server->>Agent: Tool result
-    end
-    Server->>Page: status while the agent writes or citations are checked
-    Agent-->>Server: Answer
-    Server->>Server: Check citations against describe and fetch calls
-    alt Citations missing or wrong
-        Server->>Agent: Refusal and the reason, up to 6 corrections
-        Agent-->>Server: Corrected answer
-    end
-    Server->>Server: Save the chat and an audit run
-    Server->>Page: assistant message
-    Page-->>User: Answer in the chat
-```
-
-At startup the server also asks the agent to fill the patient card from the files. Until that reply arrives, and if it never does, the sidebar shows the folder name.
-
-If the agent opens no files, it answers in plain text. If it still can't cite correctly after six corrections, or the agent can't be reached, the page shows that instead of waiting.
-
-A successful `describe` or `fetch` of a file in the case list counts as opening it. The answer then has to be the citation JSON in [Connect an agent](docs/agents.md). With no file opened, plain text is accepted, and a JSON object is sent back with a request for plain text.
-
-With no extra flags, the page talks only to `--agent-url`. Optional specialists are other chat endpoints, registered with `--agents` or repeated `--specialist name=url` flags. The server offers each one to the router as `consult_<name>`, checks each specialist's reply when it arrives, and keeps its citations as findings the router cites by id, such as `[cite:notes.1]`. Notes, DICOM, and tabular are started as their own processes and registered that way. [Connect an agent](docs/agents.md) describes them.
-
-The example agent forwards to `OPENAI_MODEL`, or to Azure OpenAI when `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, and `AZURE_OPENAI_DEPLOYMENT` are set.
-
-If the citations are still wrong after the original answer and six corrections, the page shows `The agent could not produce an answer with valid citations` and the last problem. If the agent cannot be reached, times out, or returns something other than a chat completion, the page shows `The agent failed` and the reason.
-
-The page renders a citation JSON answer as text with a marker for each `[cite:id]`. Hovering or opening a marker loads that file from the folder. [The page](docs/page.md) covers the sidebar, pins, and attachments. `pixi run docs` serves that page with the rest of the docs.
+|---|---|
+| `src/meddataos/` | The package: `core` (the controller `datactrl`, the model loop and clients, the evidence registry, the citation verifier), `harness` (tools, skills, agents, sandbox, MCP servers, notes ledger), `server` (HTTP and sessions) and `evals`. See the [code map](docs/development/architecture.md). |
+| `web/` | The page. |
+| `skills/` | Domain know-how, one `SKILL.md` per domain: `dicom`, `notes`, `tabular`. A skill grants no tools. |
+| `agents/` | Subagents, one file each: `dicom`, `notes`, `tabular`. The file names the skills it carries and the tools it is granted. |
+| `servers/` | MCP servers built for MedDataOS: `totalseg` (TotalSegmentator), runnable from a pixi environment or as an image. |
+| `configs/` | `harness.toml` (local overrides for agents), `mcp.json` (MCP servers, managed with `pixi run mcp`), `references.toml` (reference sites). |
+| `evals/` | Eval questions and the synthetic case `SYN-EVAL-01`. |
+| `examples/agent.py` | An example external agent for `--agent-url`. |
+| `tests/` | Offline tests, mirroring the package. `pixi run test`. |
+| `docs/` | This documentation. |

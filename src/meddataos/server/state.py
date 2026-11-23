@@ -9,8 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from meddataos.datactrl import tools
-from meddataos.datactrl.case import Case
+from meddataos.core.datactrl import tools
+from meddataos.core.datactrl.case import Case
 
 
 def log(who: str, message: str) -> None:
@@ -46,9 +46,14 @@ class Session:
         content: str,
         steps: list[dict] | None = None,
         duration_ms: int | None = None,
+        usage: dict | None = None,
     ) -> None:
-        """Append one turn, stamped so the page can order it."""
-        entry = {
+        """Append one turn, stamped so the page can order it.
+
+        ``usage`` is the tokens the answer took, by who asked (router, subagent).
+        """
+        # Values of several types: text, steps, a duration, token counts.
+        entry: dict[str, object] = {
             "role": role,
             "content": content,
             "timestamp": datetime.now(UTC).isoformat(),
@@ -59,6 +64,9 @@ class Session:
 
         if duration_ms is not None:
             entry["duration_ms"] = duration_ms
+
+        if usage:
+            entry["usage"] = usage
 
         self.history.append(entry)
 
@@ -103,7 +111,8 @@ class Hub:
         duration_ms: int | None = None,
     ) -> None:
         """Push an agent reply to every open page."""
-        message_out = {
+        # Values of several types: text, steps, a duration.
+        message_out: dict[str, object] = {
             "type": "assistant",
             "session_id": session_id,
             "header": "System Response",
@@ -122,21 +131,25 @@ class Hub:
 
     async def step(self, session_id: str, step: dict, elapsed_ms: int | None) -> None:
         """Push one tool or consult step to every open page."""
-        await self.broadcast({
-            "type": "step",
-            "session_id": session_id,
-            "elapsed_ms": elapsed_ms,
-            **step,
-        })
+        await self.broadcast(
+            {
+                "type": "step",
+                "session_id": session_id,
+                "elapsed_ms": elapsed_ms,
+                **step,
+            }
+        )
 
     async def status(self, session_id: str, label: str, elapsed_ms: int | None) -> None:
         """Push what the open question is doing now, such as waiting on the model."""
-        await self.broadcast({
-            "type": "status",
-            "session_id": session_id,
-            "label": label,
-            "elapsed_ms": elapsed_ms,
-        })
+        await self.broadcast(
+            {
+                "type": "status",
+                "session_id": session_id,
+                "label": label,
+                "elapsed_ms": elapsed_ms,
+            }
+        )
 
     async def _send(self, connection, message: dict) -> None:
         try:
@@ -160,7 +173,9 @@ class AppState:
         self.pins: dict[str, list] = {}
         self.reviews: dict[str, dict] = {}
         self.agent_url: str | None = None
-        self.specialists: dict = {}
+        # With --harness the server talks to the model itself, not to an agent
+        # at agent_url. See meddataos.harness.
+        self.harness: bool = False
         # Per open question, by session id. Dropped when the answer is delivered.
         self.consults: dict[str, dict] = {}
         self.findings: dict[str, dict] = {}
@@ -198,6 +213,10 @@ class AppState:
     def _load(self) -> None:
         """Restore chats, pins, and reviews saved for this case."""
         from meddataos.server import store
+
+        # open() sets root before it calls this; nothing to restore without one.
+        if self.root is None:
+            return
 
         payload = store.load(self.root)
         self.sessions = store.sessions_from_store(payload["sessions"])

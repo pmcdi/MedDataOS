@@ -1,13 +1,13 @@
 # datactrl
 
-Local medical data access harness: open a filesystem root, auto-discover DICOM / structured data / clinical notes, and fetch bounded slices for humans or LLM tools.
+The controller: the only path from MedDataOS to a case's files. It opens a filesystem root, auto-discover DICOM / structured data / clinical notes, and fetch bounded slices for humans or LLM tools.
 
 See [DESIGN.md](DESIGN.md) for scope.
 
 ## Quick start
 
 ```python
-from meddataos.datactrl import Case
+from meddataos.core.datactrl import Case
 
 case = Case.open("/path/to/case")
 report = case.discover()
@@ -42,8 +42,21 @@ for series in report.dicom:
     print(case.describe(series.id)["links"])
 print(case.fetch(report.dicom[0].id, view="metadata"))
 print(case.fetch(report.dicom[0].id, view="preview", slice_index=0))
+print(case.fetch(report.dicom[0].id, view="volume", spacing=[2, 2, 2]))       # base64 .nii.gz
+print(case.fetch(report.dicom[0].id, view="volume", out_dir="/tmp/volumes"))  # a file there
 print(case.dicom_groups("CT,SEG"))
 ```
+
+## Volumes
+
+`view="volume"` returns one gzip NIfTI, in one of two ways:
+
+| Delivery | Ask with | Returns | Largest volume |
+|---|---|---|---|
+| Inline | nothing | `volume_base64` | 33.5 M voxels (512 × 512 × 128) and 64 MB |
+| To a file | `out_dir=<folder>` | `volume_path`, the file in that folder | 268 M voxels (512 × 512 × 1024) and 1 GB |
+
+Inline is for a caller that receives the volume over a transport; its limit keeps one message small. A caller on the same machine names a folder, and the volume is written there once, named by its content, so fetching it twice writes one file. The MedDataOS server does that in harness mode, with the session workspace's `volumes/` folder. A larger volume raises `LimitExceeded` with a hint to pass a coarser `spacing`. Limits are in `limits.py`.
 
 ## Links
 
@@ -81,7 +94,7 @@ Notes:
 Via tool dispatch (same semantics, JSON in/out):
 
 ```python
-from meddataos.datactrl.tools import dispatch
+from meddataos.core.datactrl.tools import dispatch
 
 dispatch("assert_link", {
     "root": "/path/to/case",
@@ -95,7 +108,7 @@ dispatch("links", {"root": "/path/to/case", "resource_id": "note:abc123"})
 ## Tool dispatch
 
 ```python
-from meddataos.datactrl.tools import TOOL_DEFINITIONS, dispatch
+from meddataos.core.datactrl.tools import TOOL_DEFINITIONS, dispatch
 
 print(dispatch("discover", {"root": "/path/to/case"}))
 # compact inventory; then: describe / fetch / notes_search / links / assert_link / dicom_tree / dicom_groups
@@ -104,8 +117,8 @@ print(dispatch("discover", {"root": "/path/to/case"}))
 
 ## Install and tests
 
-datactrl lives in `src/meddataos/datactrl` of the MedDataOS repository and is installed with it (`pixi install`, or `pip install -e ".[datactrl]"` from the repository root). Its tests are in `tests/datactrl`:
+datactrl lives in `src/meddataos/core/datactrl` of the MedDataOS repository and is installed with it (`pixi install`, or `pip install -e ".[datactrl]"` from the repository root). It imports nothing else from MedDataOS, so the `datactrl` extra alone is enough to use it; `tests/core/test_layers.py` keeps it that way. Its tests are in `tests/core/datactrl`:
 
 ```bash
-pixi run pytest tests/datactrl
+pixi run pytest tests/core/datactrl
 ```

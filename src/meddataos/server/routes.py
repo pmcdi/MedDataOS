@@ -10,10 +10,11 @@ from uuid import uuid4
 from fastapi import APIRouter, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from meddataos.datactrl.case import Case
-from meddataos.datactrl.limits import MAX_TABLE_LIMIT
+from meddataos.core.datactrl.case import Case
+from meddataos.core.datactrl.limits import MAX_TABLE_LIMIT
+from meddataos.core.verifier.paths import path_key
 from meddataos.server import dispatch, store, timeline
-from meddataos.server.case import case, path_key
+from meddataos.server.case import case
 from meddataos.server.state import APP_ROOT, log, short_session, state
 
 router = APIRouter()
@@ -144,7 +145,7 @@ def note_span_payload(
         derived = doc.get("derived") or "ocr"
         page_index = doc.get("page_index")
     else:
-        from meddataos.datactrl.limits import MAX_NOTE_CHARS
+        from meddataos.core.datactrl.limits import MAX_NOTE_CHARS
 
         try:
             fetched = opened.fetch(doc_id, view="text", max_chars=MAX_NOTE_CHARS)
@@ -333,12 +334,13 @@ async def patient_timeline(patient_id: str):
 
 @router.get("/api/health")
 async def health():
-    """Whether a case is open, and how many pages and chats are connected."""
+    """Whether a case is open, how many pages and chats are connected, MCP status."""
     return {
         "status": "healthy",
         "case": str(state.root) if state.root else None,
         "active_connections": len(state.hub.connections),
         "active_sessions": len(state.sessions),
+        "mcp": dispatch.mcp_status(),
     }
 
 

@@ -1,0 +1,21 @@
+# Local overrides for agents (pixi run serve <case>).
+# HARNESS_CONFIG points at another file instead of this one.
+#
+# An agent is agents/<name>.md: its prompt, the skills it preloads, and the
+# tools it is granted. This file only overrides one for this deployment, so a
+# shared agent file never hard-codes a model or a step budget:
+#
+#   [agent.dicom]
+#   enabled = false            not offered (load_skill still works)
+#   model_api = "responses"    chat or responses; default HARNESS_MODEL_API
+#   model = "..."              default AZURE_OPENAI_DEPLOYMENT or OPENAI_MODEL
+#   reasoning_effort = "..."   default AZURE_OPENAI_REASONING_EFFORT or OPENAI_REASONING_EFFORT
+#   max_steps = 24             tool turns before it must answer; default 16, or the file's
+#
+# A table for an agent that has no file stops the server. A leftover
+# [subagent.*] table does too: those moved to [agent.*] and agents/.
+#
+# MCP servers are registered in configs/mcp.json (and your own scopes) with
+# `pixi run mcp add`; see docs/guides/mcp-servers.md. An agent grants a server's
+# tools itself (mcp__<server>__* in its file). `router` on the registration
+# offers them to the main model.

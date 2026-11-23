@@ -1,4 +1,8 @@
-"""UI server. Open one folder with datactrl and ask the agent at --agent-url."""
+"""UI server: open one folder with datactrl and answer questions about it.
+
+Questions go to the model itself (the harness, the default), or to an external
+agent when --agent-url is given.
+"""
 
 from __future__ import annotations
 
@@ -12,9 +16,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from meddataos.core.model import settings_from_env
 from meddataos.server import dispatch, routes
-from meddataos.server.case import case
-from meddataos.server.registry import load_specialists
 from meddataos.server.state import APP_ROOT, state
 
 load_dotenv(APP_ROOT / ".env")
@@ -22,9 +25,14 @@ load_dotenv(APP_ROOT / ".env")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Ask for the patient card once the server is up."""
+    """Connect MCP servers, start the notes ledger, and ask for the patient card.
+
+    The MCP connections close when the server stops.
+    """
+    dispatch.start_indexes()
     dispatch.fill_card()
     yield
+    dispatch.stop_indexes()
 
 
 app = FastAPI(title="MedDataOS", lifespan=lifespan)
@@ -63,20 +71,28 @@ def log_launch(root: Path, shown: str, port: int) -> None:
         reason = item.get("reason", "") if isinstance(item, dict) else ""
         print(f"  {'unknown':<12} {path}  {reason}", flush=True)
 
-    print(
-        f"Agent: {state.agent_url} model={os.getenv('AGENT_MODEL') or '?'}", flush=True
-    )
-
-    if state.specialists:
+    if state.harness:
+        settings = settings_from_env()
         print(
-            "Specialists: "
-            + ", ".join(
-                f"{name} ({spec.url})" for name, spec in state.specialists.items()
-            ),
+            f"Harness: {settings.api} API at {settings.base_url} "
+            f"model={settings.model or '?'}",
+            flush=True,
+        )
+        tools = dispatch.harness_tools()
+        sandbox = tools.sandbox_problem or f"ready ({tools.sandbox.runtime})"
+        print(f"Sandbox: {sandbox}", flush=True)
+
+        # Their tools join the list below once connected, after this banner.
+        if tools.mcp.servers:
+            print(f"MCP: {', '.join(tools.mcp.servers)} (connecting)", flush=True)
+    else:
+        print(
+            f"Agent: {state.agent_url} model={os.getenv('AGENT_MODEL') or '?'}",
             flush=True,
         )
 
-    print(f"Tools: {', '.join(case.tool_names)}", flush=True)
+    tool_names = [tool["function"]["name"] for tool in dispatch.router_tools()]
+    print(f"Tools: {', '.join(tool_names)}", flush=True)
     print(f"Web UI: http://{shown}:{port}/?patient={quote(root.name)}", flush=True)
 
 
@@ -86,26 +102,27 @@ def main() -> None:
     parser.add_argument("folder", help="Case folder to open")
     parser.add_argument(
         "--agent-url",
-        required=True,
         help=(
-            "OpenAI-compatible base URL of the router, "
-            "the part before /chat/completions"
+            "Use an external agent instead of the harness: its OpenAI-compatible "
+            "base URL, the part before /chat/completions"
         ),
     )
     parser.add_argument(
-        "--agents",
-        help="TOML file of specialists. Each table needs a url and a description.",
-    )
-    parser.add_argument(
-        "--specialist",
-        action="append",
-        metavar="NAME=URL",
-        help="Register one specialist endpoint. Repeat for each.",
+        "--harness",
+        action="store_true",
+        help=(
+            "Talk to the model directly (the default without --agent-url). The "
+            "model comes from HARNESS_MODEL_API and the Azure or OpenAI settings."
+        ),
     )
     args = parser.parse_args()
 
-    state.agent_url = args.agent_url.rstrip("/")
-    state.specialists = load_specialists(args.agents, args.specialist)
+    # Asking for both is a contradiction: one thing answers the questions.
+    if args.harness and args.agent_url:
+        parser.error("pass --agent-url or --harness, not both")
+
+    state.harness = not args.agent_url
+    state.agent_url = (args.agent_url or "").rstrip("/") or None
     root = state.open(args.folder)
     app.mount("/case", StaticFiles(directory=str(root)), name="case")
 

@@ -19,8 +19,9 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from meddataos.server import answer
-from meddataos.server.case import Answer, Contract, case, path_key
+from meddataos.core.verifier import Answer, Contract, schema
+from meddataos.core.verifier.paths import path_key
+from meddataos.server.case import case
 from meddataos.server.state import log, short_session, state
 
 MARKER = re.compile(r"\[cite:([^\]]+)\]")
@@ -321,7 +322,7 @@ def _checked(
     checked["finding"] = finding_id
 
     if not checked.get("kind"):
-        checked["kind"] = answer.kind_for(call) or "file"
+        checked["kind"] = schema.kind_for(call) or "file"
 
     if not checked.get("agent") and not checked.get("dicom"):
         agent = case._AGENT_BY_MODALITY.get(modality)
