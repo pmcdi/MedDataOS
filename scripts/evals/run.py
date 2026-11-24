@@ -34,9 +34,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from meddataos.evals.scoring import check, load_questions, parse_answer, verdict
+from .scoring import check, load_questions, parse_answer, verdict
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[2]
 QUESTIONS = REPO / "evals" / "questions"
 SYNTHETIC_CASES = REPO / "evals" / "cases"
 RESULTS = REPO / ".cache" / "evals"

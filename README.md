@@ -33,12 +33,13 @@ Open the URL it prints and ask "What was the highest AFP and when was it drawn?"
 
 | Path | Contents |
 |---|---|
-| `src/meddataos/` | The package: `core` (the controller `datactrl`, the model loop and clients, the evidence registry, the citation verifier), `harness` (tools, skills, agents, sandbox, MCP servers, notes ledger), `server` (HTTP and sessions) and `evals`. See the [code map](docs/development/architecture.md). |
+| `src/meddataos/` | The package: `core` (the controller `datactrl`, the model loop and clients, the evidence registry, the citation verifier), `harness` (tools, skills, agents, sandbox, MCP servers, notes ledger) and `server` (HTTP and sessions). See the [code map](docs/development/architecture.md). |
 | `web/` | The page. |
 | `skills/` | Domain know-how, one `SKILL.md` per domain: `dicom`, `notes`, `tabular`. A skill grants no tools. |
 | `agents/` | Subagents, one file each: `dicom`, `notes`, `tabular`. The file names the skills it carries and the tools it is granted. |
 | `servers/` | MCP servers built for MedDataOS: `totalseg` (TotalSegmentator), runnable from a pixi environment or as an image. |
 | `configs/` | `harness.toml` (local overrides for agents), `mcp.json` (MCP servers, managed with `pixi run mcp`), `references.toml` (reference sites). |
+| `scripts/evals/` | The eval runner (`pixi run eval`) and its scoring. |
 | `evals/` | Eval questions and the synthetic case `SYN-EVAL-01`. |
 | `examples/agent.py` | An example external agent for `--agent-url`. |
 | `tests/` | Offline tests, mirroring the package. `pixi run test`. |

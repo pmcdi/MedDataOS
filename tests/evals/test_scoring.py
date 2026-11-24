@@ -7,8 +7,8 @@ import re
 from datetime import date
 
 import pytest
-from meddataos.evals.run import QUESTIONS, SYNTHETIC_CASES
-from meddataos.evals.scoring import (
+from scripts.evals.run import QUESTIONS, SYNTHETIC_CASES
+from scripts.evals.scoring import (
     check,
     conflict_attributes,
     load_questions,
@@ -169,7 +169,7 @@ def test_check_reports_each_missing_group():
 
 
 def test_tokens_add_up_over_parties_and_rows():
-    from meddataos.evals.run import add_tokens, answer_tokens, summarise
+    from scripts.evals.run import add_tokens, answer_tokens, summarise
 
     answer = answer_tokens(
         {

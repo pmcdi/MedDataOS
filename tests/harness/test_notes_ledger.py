@@ -405,7 +405,7 @@ def test_tcga_ledger_replay_grounds_facts_and_finds_conflicts(monkeypatch):
 
 # ── Live gold QA (opt-in) ────────────────────────────────────────────────────
 
-# The gold set is shared with the eval runner (meddataos.evals).
+# The gold set is shared with the eval runner (scripts/evals).
 GOLD = json.loads(
     (FIXTURES.parents[2] / "evals" / "questions" / "notes.json").read_text()
 )

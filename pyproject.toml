@@ -45,12 +45,12 @@ requires = ["hatchling"]
 packages = ["src/meddataos"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.13"
-mypy_path = "src"
+mypy_path = ["src", "."]
 packages = ["meddataos"]
 exclude = ["\\.pixi/"]
 ignore_missing_imports = true

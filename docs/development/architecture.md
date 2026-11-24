@@ -1,6 +1,6 @@
 # Code map
 
-The package has three layers, plus the eval runner. Each layer imports only the layers beneath it, and `tests/core/test_layers.py` fails the build when one reaches up.
+The package has three layers. Each layer imports only the layers beneath it, and `tests/core/test_layers.py` fails the build when one reaches up. The eval runner lives outside the package, in `scripts/evals`.
 
 ```
 src/meddataos/
@@ -34,7 +34,7 @@ src/meddataos/
     state.py, store.py     sessions in memory; chats, pins and runs in SQLite
     findings.py            a subagent's checked findings
     timeline.py            the page's timeline
-  evals/                   the eval runner and scoring
+scripts/evals/             the eval runner and scoring (not part of the package)
 servers/totalseg/          TotalSegmentator as an MCP server (its own pixi env)
 skills/                    one SKILL.md per domain; requires and uses list tools, grants none
 agents/                    one file per agent: dicom, notes, tabular
@@ -75,6 +75,7 @@ web/                       the page
 | An agent (a subagent) | `agents/<name>.md` |
 | A citation check | `core/verifier/contract.py` |
 | A route or page behaviour | `server/` and `web/` |
+| Eval scoring or the runner | `scripts/evals/`; questions stay in `evals/questions/` |
 
 ## Tests
 

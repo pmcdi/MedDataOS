@@ -31,10 +31,10 @@ FORBIDDEN = {
         "meddataos.core.verifier",
         "meddataos.harness",
         "meddataos.server",
-        "meddataos.evals",
+        "scripts",
     ),
-    "core": ("meddataos.harness", "meddataos.server", "meddataos.evals"),
-    "harness": ("meddataos.server", "meddataos.evals"),
+    "core": ("meddataos.harness", "meddataos.server", "scripts"),
+    "harness": ("meddataos.server", "scripts"),
 }
 
 
