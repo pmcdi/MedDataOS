@@ -358,6 +358,25 @@ def _inside(value: str, workspace: Path) -> str:
     return str(path)
 
 
+def with_path_defaults(arguments: dict, marked: frozenset[str], schema: dict) -> dict:
+    """The arguments, plus the schema's relative default for each omitted path.
+
+    Left to the server, a relative default such as ``out/masks`` resolves in its
+    own working directory, which in a container is not the workspace. An
+    absolute default names a place in the server's image, so it stays there.
+    """
+    properties = schema.get("properties") or {}
+    filled = dict(arguments)
+
+    for name in marked - set(arguments):
+        default = properties[name].get("default")
+
+        if isinstance(default, str) and default and not Path(default).is_absolute():
+            filled[name] = default
+
+    return filled
+
+
 def resolve_marked(arguments: dict, marked: frozenset[str], workspace: Path) -> dict:
     """The marked parameters made absolute workspace paths; the rest untouched."""
     resolved = dict(arguments)
@@ -745,11 +764,12 @@ class McpHub:
         path_root = workspace if server.workspace_paths else None
 
         if path_root is not None:
-            arguments = (
-                resolve_marked(arguments, tool.path_params, path_root)
-                if tool.path_params is not None
-                else resolve_paths(arguments, path_root)
-            )
+            if tool.path_params is None:
+                arguments = resolve_paths(arguments, path_root)
+            else:
+                schema = tool.definition["function"]["parameters"]
+                arguments = with_path_defaults(arguments, tool.path_params, schema)
+                arguments = resolve_marked(arguments, tool.path_params, path_root)
 
         future = asyncio.run_coroutine_threadsafe(
             client.call_tool(

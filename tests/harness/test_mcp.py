@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 from meddataos.core import registry
 from meddataos.core.registry import Evidence
-from meddataos.harness.mcp import McpError, McpHub, relativize, resolve_paths
+from meddataos.harness.mcp import (
+    McpError,
+    McpHub,
+    relativize,
+    resolve_paths,
+    with_path_defaults,
+)
 from meddataos.harness.mcp_config import ServerConfig
 from meddataos.harness.tools import HarnessTools
 
@@ -75,7 +81,7 @@ def test_a_path_that_leaves_the_workspace_is_refused(workspace):
 
 
 def test_tools_are_namespaced_and_registered_with_the_servers_class(hub):
-    assert hub.status["seg"] == "connected (8 tools)"
+    assert hub.status["seg"] == "connected (9 tools)"
     assert "mcp__seg__segment" in hub.tools
     assert registry.evidence_of("mcp__seg__segment") is Evidence.DERIVED
     assert registry.source_of("mcp__seg__segment") == "mcp:seg"
@@ -147,6 +153,7 @@ def test_a_pattern_expands_to_that_server_and_the_router_flag_is_separate(hub):
             "crash",
             "oom",
             "locate",
+            "save",
             "overlay",
         )
     }
@@ -171,3 +178,28 @@ def test_harness_tools_run_mcp_tools_and_show_their_pictures(hub, workspace, tmp
         "message": failed["message"],
     }
     assert "model weights missing" in failed["message"]
+
+
+def test_an_omitted_output_folder_still_lands_in_the_workspace(hub, workspace):
+    result = hub.call("mcp__seg__save", {"label": "GTVp"}, workspace)
+
+    assert (workspace / "out" / "masks" / "GTVp.nii.gz").exists()
+    assert "out/masks/GTVp.nii.gz" in result["text"]
+    assert str(workspace) not in result["text"]
+
+
+def test_only_relative_path_defaults_are_filled():
+    schema = {
+        "properties": {
+            "out_dir": {"default": "out/masks"},
+            "model_path": {"default": "/opt/weights"},
+            "mask_path": {"default": None},
+            "image_path": {},
+        }
+    }
+    marked = frozenset(schema["properties"])
+
+    assert with_path_defaults({}, marked, schema) == {"out_dir": "out/masks"}
+    assert with_path_defaults({"out_dir": "out/x"}, marked, schema) == {
+        "out_dir": "out/x"
+    }

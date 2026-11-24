@@ -953,7 +953,9 @@ async def consult_subagent(
     mcp_definitions = harness.mcp.definitions_for(set(agent.tools))
     own = harness.own_definitions()
     tools = offered_tools(agent.tools, case.tools, own, mcp_definitions)
-    own_names = {item["function"]["name"] for item in own}
+    # MCP tools run in the harness too. Any name left out here goes to the case
+    # controller, which does not know it.
+    harness_names = {item["function"]["name"] for item in [*own, *mcp_definitions]}
     offered_names = {item["function"]["name"] for item in tools}
     conversation = Conversation(
         [
@@ -973,7 +975,7 @@ async def consult_subagent(
         max_steps=agent.max_steps,
         activity=f"Waiting for {agent.name}",
         by=agent.name,
-        harness_tool_names=offered_names & own_names,
+        harness_tool_names=offered_names & harness_names,
         offload=True,
         parent_step=parent_step,
     )

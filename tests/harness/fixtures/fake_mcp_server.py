@@ -67,6 +67,16 @@ def oom() -> str:
 
 
 @server.tool()
+def save(label: str, out_dir: str = "out/masks") -> str:
+    """Write an empty mask under out_dir."""
+    folder = Path(out_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    mask = folder / f"{label}.nii.gz"
+    mask.write_bytes(b"")
+    return str(mask)
+
+
+@server.tool()
 def locate(image_path: str, label: str) -> str:
     """Report where a marked path argument arrived, beside an unmarked one."""
     return f"{image_path} | {label}"
